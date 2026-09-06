@@ -1,0 +1,26 @@
+NOTICES — 派生与授权说明
+========================
+
+本软件 @loostone/dsh-newapi-wallet 派生自上游开源项目：
+
+  dsh-gateway-wallet v0.1.0
+  作者：MuAllen
+  仓库：https://github.com/MuAllen/dsh-gateway-wallet
+  许可：MIT（原文见同目录 LICENSE，未作修改）
+
+MIT 许可要求保留上游版权声明与许可全文，本仓库已满足。上游作者不认可、也不
+担保本派生版本的任何行为。
+
+派生差异（为什么要有我们自己的一份）
+------------------------------------
+上游把「模型调用用的 sk- API key」直接当作 New API 用户级路由的 Authorization
+凭据发送。我们内部署的 New API 在 /api/user/self、/api/data/self、
+/api/log/self* 这些路由上要求的是「访问令牌」（个人设置里生成的 access token），
+因此上游在我们的网关上必然返回 401 AUTH_UNAUTHORIZED。本 fork 引入独立的访问
+令牌配置项、修正取数端点集合，并把展示币种按网关自身声明改为人民币。
+
+我们不再跟随上游更新；后续维护由我们自己负责。
+
+本 fork 的改动集中在：凭据来源（settings 命名空间 newapi-wallet）、端点集合、
+金额换算与展示币种、内部标识与回环路由改名（loostone-newapi-wallet /
+/api/newapi-wallet）。

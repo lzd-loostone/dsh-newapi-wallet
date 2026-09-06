@@ -1,0 +1,2 @@
+# 预构建产物必须与 npm pack / tarball 字节一致，禁用 EOL 自动转换
+* -text

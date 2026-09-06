@@ -1,0 +1,11 @@
+# @loostone/dsh-newapi-wallet — bundle patch
+#
+# 安装进 profile 后自动生效：`dsh plugin --profile web add @loostone/dsh-newapi-wallet@0.1.0`
+# 会把本包追加到 package.json 的 dsh.profile.bundles 层栈，无需手工编辑任何配置。
+#
+# row id 故意与上游不同（上游为 dsh-gateway-wallet），两者即使同时安装也不会撞名。
+# name 必须可被解析；scoped 包名要加引号。
+- insert:
+    - id: loostone-newapi-wallet
+      name: '@loostone/dsh-newapi-wallet'
+      config: {}
