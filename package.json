@@ -31,6 +31,7 @@
     "lib",
     "src",
     "scripts",
+    "docs",
     "cordis.patch.yml",
     "LICENSE",
     "NOTICES.txt",
