@@ -1,10 +1,18 @@
 {
   "name": "@loostone/dsh-newapi-wallet",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "DSH 侧边栏显示公司自建 New API 网关的真实账本：今日实扣（人民币）、按模型拆分、逐条消费明细。金额只来自网关账本，不做本地 token 估算。",
   "type": "module",
   "license": "MIT",
   "author": "Loostone",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lzd-loostone/dsh-newapi-wallet.git"
+  },
+  "homepage": "https://github.com/lzd-loostone/dsh-newapi-wallet#readme",
+  "bugs": {
+    "url": "https://github.com/lzd-loostone/dsh-newapi-wallet/issues"
+  },
   "forkOf": {
     "name": "dsh-gateway-wallet",
     "version": "0.1.0",

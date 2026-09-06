@@ -25,25 +25,22 @@
 
 ```sh
 # GitHub（推荐）：pnpm 会规范化为 hosted 规格，直接下载匿名 HTTPS tarball 并按 commit SHA 锁定
-dsh plugin --profile web add "github:lzd-loostone/dsh-newapi-wallet#v0.1.5"
+dsh plugin --profile web add "github:lzd-loostone/dsh-newapi-wallet#v0.1.6"
 
 # 等价的显式 HTTPS git 地址（效果同上，锁文件里仍会记成 hosted 规格）
-dsh plugin --profile web add "https://github.com/lzd-loostone/dsh-newapi-wallet.git#v0.1.5"
+dsh plugin --profile web add "https://github.com/lzd-loostone/dsh-newapi-wallet.git#v0.1.6"
 
 # 也可以直接给归档 tarball 地址
-dsh plugin --profile web add "https://codeload.github.com/lzd-loostone/dsh-newapi-wallet/tar.gz/refs/tags/v0.1.5"
-
-# Gitee 镜像（国内网络更稳；这条走 git over HTTPS，公开仓库匿名可读）
-dsh plugin --profile web add "https://gitee.com/WB_LZD/dsh-newapi-wallet.git#v0.1.5"
+dsh plugin --profile web add "https://codeload.github.com/lzd-loostone/dsh-newapi-wallet/tar.gz/refs/tags/v0.1.6"
 
 # 或从内部 npm registry
 dsh plugin --profile web add @loostone/dsh-newapi-wallet@0.1.5
 
 # 或分发本地 tarball 文件
-dsh plugin --profile web add <路径>\loostone-dsh-newapi-wallet-0.1.5.tgz
+dsh plugin --profile web add <路径>\loostone-dsh-newapi-wallet-0.1.6.tgz
 ```
 
-- **请钉 tag 或 commit**（`#v0.1.5`），不要写 `#main`/`#master`：pnpm 会把 tag 解析成具体 commit 并把 `codeload` 的 SHA 地址写进 `pnpm-lock.yaml`，同事之间装到的字节完全一致。
+- **请钉 tag 或 commit**（`#v0.1.6`），不要写 `#main`/`#master`：pnpm 会把 tag 解析成具体 commit 并把 `codeload` 的 SHA 地址写进 `pnpm-lock.yaml`，同事之间装到的字节完全一致。
 - 预构建产物 `lib/` 已入库，所以**安装不触发任何构建脚本**，也不会被 pnpm 的构建脚本策略拦截。
 - 零运行时依赖。
 - 用本地 `.tgz` 安装时注意：pnpm 会把它记成 `file:` 依赖，**装完那个文件不能删也不能挪**，否则以后每次 `dsh plugin` / `pnpm install` 都会因解析不到路径而失败。上面的 URL 方式无此约束。
