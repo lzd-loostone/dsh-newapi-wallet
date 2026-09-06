@@ -1,6 +1,7 @@
 /**
  * 侧边栏左下角入口：与「用量账本」同槽，点击弹出站点真实账本（今日实扣、
- * 按模型拆分、逐条明细），另在设置页注册 newapi-wallet 卡片填访问令牌。
+ * 按模型拆分带金额、输入/输出/缓存分桶金额、逐条明细），另在设置页注册
+ * newapi-wallet 卡片填访问令牌。
  * 金额一律人民币（¥）；访问令牌只写入设置，不出现在任何展示或日志里。
  */
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
@@ -16,9 +17,11 @@ import {
 import type {
   AccountListItem,
   CallRecord,
+  DailyPoint,
   Money,
   TodayModelRow,
   TokenBuckets,
+  UsageAmounts,
   WalletBundle,
   WalletError,
   WalletPayload,
@@ -113,6 +116,34 @@ const CSS = [
   '.gww_save[data-busy]{opacity:.5;cursor:default}',
   '.gww_save[data-done]{color:var(--dsw-alias-state-success-primary)}',
   '.gww_inputError{color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:16px;margin:4px 0 0}',
+  '.gww_heat{--gww-heat:#31a06b;display:flex;flex-direction:column;gap:6px}',
+  '.gww_heat{--h0:var(--dsw-alias-bg-layer-3);--h1:#9be9a8;--h1:light-dark(#9be9a8,#0e4429);--h2:#40c463;--h2:light-dark(#40c463,#006d32);--h3:#30a14e;--h3:light-dark(#30a14e,#26a641);--h4:#216e39;--h4:light-dark(#216e39,#39d353)}',
+  '.gww_heat{--t1:light-dark(#14532d,#d6f5e2);--t2:light-dark(#0b3a20,#eafff2);--t3:#062d16;--t4:light-dark(#ffffff,#052411)}',
+  '.gww_heatHead{gap:5px;display:grid;grid-template-columns:repeat(7,1fr)}',
+  '.gww_heatWd{text-align:center;color:var(--dsw-alias-label-caption);font-size:10px;line-height:12px}',
+  '.gww_heatGrid{gap:5px;display:grid;grid-template-columns:repeat(7,1fr);position:relative}',
+  '.gww_heatCell{aspect-ratio:5/4;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;line-height:1;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-interactive-bg-hover);transition:transform .12s ease,box-shadow .12s ease}',
+  '.gww_heatCell[data-tier="0"]{background:var(--h0)}',
+  '.gww_heatCell[data-tier="1"]{color:var(--t1);background:var(--h1)}',
+  '.gww_heatCell[data-tier="2"]{color:var(--t2);background:var(--h2)}',
+  '.gww_heatCell[data-tier="3"]{color:var(--t3);background:var(--h3)}',
+  '.gww_heatCell[data-tier="4"]{color:var(--t4);background:var(--h4)}',
+  '.gww_heatCell[data-none]{border:1px dashed var(--dsw-alias-border-l2);background:0 0}',
+  '.gww_heatCell[data-future]{border:none;background:0 0}',
+  '.gww_heatCell[data-today]{box-shadow:inset 0 0 0 1.5px color-mix(in oklab,var(--gww-heat) 85%,Canvas)}',
+  '.gww_heatCell:not([data-future]){cursor:default;position:relative}',
+  '.gww_heatCell:not([data-future]):hover{transform:scale(1.06);box-shadow:0 0 0 2px color-mix(in oklab,var(--gww-heat) 45%,transparent),0 2px 8px color-mix(in oklab,var(--gww-heat) 25%,transparent);z-index:2}',
+  '.gww_tip{position:absolute;transform:translate(-50%,-100%);background:var(--dsw-alias-bg-overlay,Canvas);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;box-shadow:var(--dsw-shadow-lv2);padding:6px 9px;pointer-events:none;white-space:nowrap;z-index:6;display:flex;flex-direction:column;gap:1px}',
+  '.gww_tipDate{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px}',
+  '.gww_tipVal{color:var(--dsw-alias-label-primary);font-size:13px;line-height:18px;font-weight:600;font-variant-numeric:tabular-nums}',
+  '.gww_tipSub{color:var(--dsw-alias-label-caption);font-size:11px;line-height:15px}',
+  '.gww_heatLegend{align-items:center;gap:4px;display:flex;justify-content:flex-end;color:var(--dsw-alias-label-caption);font-size:10px;line-height:14px}',
+  '.gww_heatSwatch{width:10px;height:10px;border-radius:3px;display:inline-block}',
+  '.gww_heatSwatch[data-lv="1"]{background:var(--h1)}',
+  '.gww_heatSwatch[data-lv="2"]{background:var(--h2)}',
+  '.gww_heatSwatch[data-lv="3"]{background:var(--h3)}',
+  '.gww_heatSwatch[data-lv="4"]{background:var(--h4)}',
+  '.gww_heatDash{width:10px;height:10px;border:1px dashed var(--dsw-alias-border-l2);border-radius:3px;display:inline-block;margin-left:6px}',
 ].join('')
 
 function ensureCss(): void {
@@ -237,14 +268,22 @@ function AccountPicker({
   )
 }
 
-function BucketRows({ title, buckets }: { title: string; buckets: TokenBuckets }) {
-  const rows: Array<{ name: string; value: string }> = [
+function BucketRows({
+  title,
+  buckets,
+  amounts,
+}: {
+  title: string
+  buckets: TokenBuckets
+  amounts?: UsageAmounts
+}) {
+  const rows: Array<{ name: string; value: string; amount?: Money }> = [
     { name: '请求', value: fmtCount(buckets.requests) },
-    { name: '输入', value: fmtCount(buckets.inputTokens) },
-    { name: '输出', value: fmtCount(buckets.outputTokens) },
+    { name: '输入(未缓存)', value: fmtCount(buckets.inputTokens), amount: amounts?.input },
+    { name: '输出', value: fmtCount(buckets.outputTokens), amount: amounts?.output },
   ]
-  if (buckets.cacheReadTokens !== undefined) rows.push({ name: '缓存命中', value: fmtCount(buckets.cacheReadTokens) })
-  if (buckets.totalTokens !== undefined) rows.push({ name: '合计 token', value: fmtCount(buckets.totalTokens) })
+  if (buckets.cacheReadTokens !== undefined) rows.push({ name: '缓存命中', value: fmtCount(buckets.cacheReadTokens), amount: amounts?.cacheRead })
+  if (buckets.totalTokens !== undefined) rows.push({ name: '合计 token', value: fmtCount(buckets.totalTokens), amount: amounts?.total })
   return (
     <div className="gww_section">
       <div className="gww_sectionTitle">{title}</div>
@@ -252,7 +291,10 @@ function BucketRows({ title, buckets }: { title: string; buckets: TokenBuckets }
         {rows.map(row => (
           <div key={row.name} className="gww_row">
             <span className="gww_rowName">{row.name}</span>
-            <span className="gww_rowValue">{row.value}</span>
+            <span className="gww_rowValue">
+              {row.value}
+              {row.amount !== undefined && <>{' · '}{fmtMoney(row.amount)}</>}
+            </span>
           </div>
         ))}
       </div>
@@ -266,10 +308,14 @@ function ModelRows({ models }: { models: TodayModelRow[] }) {
       <div className="gww_sectionTitle">今日按模型</div>
       <div className="gww_rows">
         {models.map(row => (
-          <div key={row.model} className="gww_row">
+          <div
+            key={row.model}
+            className="gww_row"
+            title={'token ' + fmtCount(row.tokens) + ' · 账本额度点 ' + fmtCount(row.quota)}
+          >
             <span className="gww_rowName">{row.model}</span>
             <span className="gww_rowValue">
-              {fmtMoney({ quota: row.quota, display: row.quota === 0 ? 0 : undefined, currency: 'CNY' })}
+              {fmtMoney(row.amount ?? { quota: row.quota, display: row.quota === 0 ? 0 : undefined, currency: 'CNY' })}
               {' · '}
               {fmtCount(row.calls)} 次
             </span>
@@ -305,6 +351,148 @@ function CallRows({ calls }: { calls: CallRecord[] }) {
             </div>
           )
         })}
+      </div>
+    </div>
+  )
+}
+
+/* ------------------------------------------------------------------ */
+/* 近 4 周消费热力图：行 0=本周（列 周一→周日），行 3=三周前。      */
+/* 颜色 = 当日实扣（GitHub 贡献图色板，线性 20/45/70% 分 4 档）；   */
+/* 格内显示日号（2/3/4…），每月 1 号显示「X月」；悬停弹卡，无点击。  */
+/* ------------------------------------------------------------------ */
+
+const HEAT_WEEKS = 4
+const HEAT_WEEKDAY_CHARS = ['一', '二', '三', '四', '五', '六', '日']
+
+function localDateStr(d: Date): string {
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  return `${d.getFullYear()}-${mm}-${dd}`
+}
+
+interface HeatCell {
+  key: string
+  dateStr: string
+  weekday: string
+  future: boolean
+  point: DailyPoint | undefined
+}
+
+interface HeatTip {
+  left: number
+  top: number
+  date: string
+  weekday: string
+  text: string
+  sub: string | undefined
+}
+
+function HeatmapSection({ points }: { points: DailyPoint[] }) {
+  const gridRef = useRef<HTMLDivElement>(null)
+  const [tip, setTip] = useState<HeatTip | undefined>(undefined)
+  const byDate = new Map(points.map(point => [point.date, point]))
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const todayStr = localDateStr(today)
+  const wdIndex = (today.getDay() + 6) % 7
+  const maxQuota = points.reduce((acc, p) => (p.available && p.quota > acc ? p.quota : acc), 0)
+  let totalCny = 0
+  for (const p of points) {
+    if (p.available && typeof p.amount?.display === 'number') totalCny += p.amount.display
+  }
+  // 线性阈值分档（占 28 天内最大值）：<20% / <45% / <70% / ≥70% → 1..4 档。
+  // 之前用 √ 比例会把大多数天压进深档，深浅就"看不出差别"——别再压缩。
+  const tierOf = (p: DailyPoint): number => {
+    if (!p.available || p.quota <= 0 || maxQuota <= 0) return 0
+    const r = p.quota / maxQuota
+    return r >= 0.7 ? 4 : r >= 0.45 ? 3 : r >= 0.2 ? 2 : 1
+  }
+  const cells: HeatCell[] = []
+  for (let row = 0; row < HEAT_WEEKS; row++) {
+    for (let col = 0; col < 7; col++) {
+      // 日历方向：行 0=三周前（最旧在上），最后一行=本周；列恒为周一→周日。
+      const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - wdIndex - (HEAT_WEEKS - 1 - row) * 7 + col)
+      const dateStr = localDateStr(d)
+      cells.push({
+        key: `${row}-${col}`,
+        dateStr,
+        weekday: '日一二三四五六'[d.getDay()] ?? '',
+        future: dateStr > todayStr,
+        point: byDate.get(dateStr),
+      })
+    }
+  }
+  const enter = (event: React.MouseEvent<HTMLDivElement>, cell: HeatCell): void => {
+    const grid = gridRef.current
+    if (grid === null) return
+    const cr = event.currentTarget.getBoundingClientRect()
+    const gr = grid.getBoundingClientRect()
+    const p = cell.point
+    let text: string
+    let sub: string | undefined
+    if (p === undefined || !p.available) {
+      text = '无数据'
+    } else {
+      text = fmtMoney(p.amount ?? { quota: p.quota, display: p.quota === 0 ? 0 : undefined, currency: 'CNY' })
+      sub = p.calls !== undefined ? `${fmtCount(p.calls)} 次调用` : undefined
+    }
+    setTip({
+      left: Math.min(Math.max(cr.left - gr.left + cr.width / 2, 52), gr.width - 52),
+      top: cr.top - gr.top - 6,
+      date: cell.dateStr,
+      weekday: cell.weekday,
+      text,
+      sub,
+    })
+  }
+  const leave = (): void => setTip(undefined)
+  return (
+    <div className="gww_section">
+      <div className="gww_sectionTitle">
+        近 4 周逐日实扣 · 合计 {totalCny < 1 && totalCny > 0 ? totalCny.toFixed(4) : totalCny.toFixed(2)} 元
+      </div>
+      <div className="gww_heat">
+        <div className="gww_heatHead">
+          {HEAT_WEEKDAY_CHARS.map(wd => <span key={wd} className="gww_heatWd">{wd}</span>)}
+        </div>
+        <div className="gww_heatGrid" ref={gridRef} onMouseLeave={leave}>
+          {cells.map(cell => cell.future ? (
+            <div key={cell.key} className="gww_heatCell" data-future="" />
+          ) : (
+            <div
+              key={cell.key}
+              className="gww_heatCell"
+              {...cell.point !== undefined && cell.point.available
+                ? { 'data-tier': String(tierOf(cell.point)) }
+                : { 'data-none': '' }}
+              {...cell.dateStr === todayStr ? { 'data-today': '' } : {}}
+              onMouseEnter={event => enter(event, cell)}
+            >
+              {cell.point !== undefined
+                ? (cell.dateStr.endsWith('-01')
+                  ? `${Number(cell.dateStr.slice(5, 7))}月`
+                  : Number(cell.dateStr.slice(8)))
+                : ''}
+            </div>
+          ))}
+          {tip !== undefined && (
+            <div className="gww_tip" style={{ left: tip.left, top: tip.top }}>
+              <span className="gww_tipDate">{tip.date.slice(5).replace('-', '/')} · 周{tip.weekday}</span>
+              <span className="gww_tipVal">{tip.text}</span>
+              {tip.sub !== undefined && <span className="gww_tipSub">{tip.sub}</span>}
+            </div>
+          )}
+        </div>
+        <div className="gww_heatLegend">
+          <span>少</span>
+          {[1, 2, 3, 4].map(lv => (
+            <span key={lv} className="gww_heatSwatch" data-lv={lv} />
+          ))}
+          <span>多</span>
+          <span className="gww_heatDash" aria-hidden="true" />
+          <span>无数据</span>
+        </div>
       </div>
     </div>
   )
@@ -439,26 +627,13 @@ function WalletBody({
       )}
 
       {snapshot.todayTokens !== undefined && (
-        <BucketRows title="今日用量" buckets={snapshot.todayTokens} />
+        <BucketRows title="今日用量" buckets={snapshot.todayTokens} amounts={snapshot.todayAmounts} />
       )}
-      {snapshot.rate !== undefined && (snapshot.rate.rpm !== undefined || snapshot.rate.tpm !== undefined) && (
-        <div className="gww_section">
-          <div className="gww_sectionTitle">速率</div>
-          <div className="gww_rows">
-            {snapshot.rate.rpm !== undefined && (
-              <div className="gww_row">
-                <span className="gww_rowName">RPM</span>
-                <span className="gww_rowValue">{fmtCount(snapshot.rate.rpm)}</span>
-              </div>
-            )}
-            {snapshot.rate.tpm !== undefined && (
-              <div className="gww_row">
-                <span className="gww_rowName">TPM</span>
-                <span className="gww_rowValue">{fmtCount(snapshot.rate.tpm)}</span>
-              </div>
-            )}
-          </div>
-        </div>
+      {snapshot.todayLogsPartial === true && (
+        <p className="gww_note">今日账单超过 1000 条，token 与金额拆分按最近 1000 条统计。</p>
+      )}
+      {snapshot.dailyHistory !== undefined && snapshot.dailyHistory.length > 0 && (
+        <HeatmapSection points={snapshot.dailyHistory} />
       )}
       {snapshot.recentCalls !== undefined && snapshot.recentCalls.length > 0 && (
         <CallRows calls={snapshot.recentCalls} />

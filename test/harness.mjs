@@ -109,6 +109,7 @@ if (w.balance) console.log('    balance =', JSON.stringify(w.balance))
 if (w.usage) console.log('    usage =', JSON.stringify(w.usage))
 if (w.today) console.log('    今日 =', JSON.stringify(w.today))
 if (w.todayModels) console.log('    今日按模型 =', JSON.stringify(w.todayModels))
+if (w.todayAmounts) console.log('    今日金额拆分 =', JSON.stringify(w.todayAmounts), ' 扫描行数 =', w.todayLogRows, w.todayLogsPartial ? '(partial)' : '')
 if (w.meter) console.log('    meter =', JSON.stringify(w.meter))
 if (w.rate) console.log('    rate =', JSON.stringify(w.rate))
 if (w.fingerprint) console.log('    指纹 =', JSON.stringify(w.fingerprint))
@@ -122,6 +123,46 @@ const leaks = []
 // 这条断言防的是历史上那个真缺陷：客户端用写死的 45s，设置里的 refreshMs 全链路无人读取。
 if (payload.refreshMs === 15000) console.log('    ✓ 宿主按设置下发 refreshMs = 15000')
 else leaks.push('refreshMs 未按设置下发（得到 ' + JSON.stringify(payload.refreshMs) + '，期望 15000）')
+// 金额展示断言（0.1.7）：按模型每行必须带 ¥；分桶金额之和必须等于合计。
+{
+  const tm = Array.isArray(w.todayModels) ? w.todayModels : []
+  if (tm.length === 0) leaks.push('todayModels 为空，按模型金额无从校验')
+  else if (tm.some(m => !m.amount || typeof m.amount.display !== 'number' || m.amount.currency !== 'CNY')) leaks.push('todayModels 有行缺 amount.display/CNY')
+  else console.log('    ✓ 今日按模型每行都带 ¥ 金额')
+  const a = w.todayAmounts
+  if (!a) leaks.push('缺 todayAmounts')
+  else {
+    const parts = [a.input, a.output, a.cacheRead].map(x => typeof x?.display === 'number' ? x.display : NaN)
+    const sum = parts.reduce((x, y) => x + y, 0)
+    if (parts.some(Number.isNaN) || !a.total || typeof a.total.display !== 'number') leaks.push('todayAmounts 分桶金额不全')
+    else if (Math.abs(sum - a.total.display) > 0.005) leaks.push('分桶金额之和 != 合计 (' + sum + ' vs ' + a.total.display + ')')
+    else console.log('    ✓ 输入+输出+缓存 金额之和 == 合计 (¥' + a.total.display.toFixed(2) + ')')
+    if (w.today && typeof w.today.display === 'number' && a.total) {
+      console.log('    ⓘ 今日实扣(stat) ¥' + w.today.display.toFixed(2) + ' vs 账本逐条合计 ¥' + a.total.display.toFixed(2))
+    }
+  }
+}
+// 热力图断言（近 4 周）：28 格齐、昨日格数值必须 == stat 昨日窗口（实测完全一致）
+{
+  const hist = Array.isArray(w.dailyHistory) ? w.dailyHistory : []
+  if (hist.length !== 28) leaks.push('dailyHistory 不是 28 格 (' + hist.length + ')')
+  const y = new Date(); y.setHours(0, 0, 0, 0); y.setDate(y.getDate() - 1)
+  const yStr = y.getFullYear() + '-' + String(y.getMonth() + 1).padStart(2, '0') + '-' + String(y.getDate()).padStart(2, '0')
+  const yp = hist.find(p => p.date === yStr)
+  const avail = hist.filter(p => p.available).length
+  console.log('    ⓘ 热力图: ' + hist.length + ' 格, 有数据 ' + avail + ' 格, 昨日(' + yStr + ') quota=' + (yp ? yp.quota : '缺'))
+  if (!yp || yp.available !== true || typeof yp.amount?.display !== 'number') leaks.push('昨日热力格无数据')
+  else {
+    const s0 = Math.floor(y.getTime() / 1000)
+    const stJson = await fetch(ORIGIN + '/api/log/self/stat?type=2&start_timestamp=' + s0 + '&end_timestamp=' + (s0 + 86400), { headers: { authorization: 'Bearer ' + TOKEN, accept: 'application/json' } }).then(r => r.json())
+    const stQ = stJson?.data?.quota
+    if (typeof stQ === 'number' && Math.abs(stQ - yp.quota) > 1) leaks.push('昨日热力值(' + yp.quota + ') != stat(' + stQ + ')')
+    else console.log('    ✓ 热力图昨日 == stat 昨日 (' + stQ + ')')
+  }
+  const tp = hist[hist.length - 1]
+  if (tp && w.today && Math.abs((tp.quota ?? 0) - w.today.quota) > w.today.quota * 0.02 + 5000) leaks.push('今日热力格与头部今日实扣偏差过大')
+  else console.log('    ✓ 今日热力格与头部今日实扣同源一致 (quota=' + (tp ? tp.quota : '—') + ')')
+}
 if (ok.body.includes(TOKEN)) leaks.push('响应体含访问令牌')
 if (/"authorization"/i.test(ok.body)) leaks.push('响应体含 authorization 字段')
 if (ok.body.includes(FAKE_SK)) leaks.push('响应体含模型调用密钥')

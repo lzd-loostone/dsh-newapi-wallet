@@ -1,7 +1,7 @@
 {
   "name": "@loostone/dsh-newapi-wallet",
-  "version": "0.1.6",
-  "description": "DSH 侧边栏显示公司自建 New API 网关的真实账本：今日实扣（人民币）、按模型拆分、逐条消费明细。金额只来自网关账本，不做本地 token 估算。",
+  "version": "0.1.7",
+  "description": "DSH 侧边栏显示自建 New API 网关的真实账本：今日实扣（人民币）、按模型拆分带金额、输入/输出/缓存分桶金额、近 4 周逐日消费热力图、逐条消费明细。金额只来自网关账本，不做本地 token 估算。",
   "type": "module",
   "license": "MIT",
   "author": "Loostone",

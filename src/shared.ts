@@ -28,6 +28,36 @@ export interface TokenBuckets {
   totalTokens?: number
 }
 
+/** 近 4 周热力图的一天（宿主返回按日期从旧到新排列）。 */
+export interface DailyPoint {
+  /** 本地日期 YYYY-MM-DD。 */
+  date: string
+  /** 网关能给出该日数字。false = 无数据（保留范围外或探测预算用尽），绝不伪装成 ¥0。 */
+  available: boolean
+  /** 当日实扣 quota 点数；available=false 时为 0。 */
+  quota: number
+  /** 当日调用次数。 */
+  calls?: number
+  /** 当日金额（available=true 时给出）。 */
+  amount?: Money
+}
+
+/**
+ * 今日各 token 桶对应的金额（人民币）。来自全天账本行（/api/log/self）的拆分：
+ * 每行按账本自带的 model_ratio / completion_ratio / cache_ratio / group_ratio
+ * 分账，再按该行真实 quota 回缩——拆分合计恒等于该行实扣，不是本地估价。
+ */
+export interface UsageAmounts {
+  /** 未缓存输入部分的费用（与 buckets.inputTokens 同口径）。 */
+  input?: Money
+  /** 输出部分的费用。 */
+  output?: Money
+  /** 缓存命中部分的费用（与 buckets.cacheReadTokens 同口径）。 */
+  cacheRead?: Money
+  /** 今日账本扫描范围内全部实扣合计（= input+output+cacheRead）。 */
+  total?: Money
+}
+
 /** 今日按模型拆分的一行（来自 /api/data/self 的聚合行）。 */
 export interface TodayModelRow {
   model: string
@@ -37,6 +67,8 @@ export interface TodayModelRow {
   calls: number
   /** 该模型今日 token 消耗（token_used 合计）。 */
   tokens?: number
+  /** 该模型今日实扣金额（账本 quota 直接换算，非估算）。 */
+  amount?: Money
 }
 
 /** 逐条消费明细里的一笔（来自 /api/log/self?type=2）。 */
@@ -80,6 +112,14 @@ export interface WalletSnapshot {
   /** 今日消费（实扣）。读不到则省略。 */
   today?: Money & { requests?: number }
   todayTokens?: TokenBuckets
+  /** 今日用量的分桶金额（口径见 UsageAmounts 注释）。 */
+  todayAmounts?: UsageAmounts
+  /** 近 4 周逐日消费（热力图）。取数失败时整个字段缺省，前端隐藏该区块。 */
+  dailyHistory?: DailyPoint[]
+  /** 今日实际扫描到的账单行数（token/金额拆分的口径）。 */
+  todayLogRows?: number
+  /** true = 今日行数超过扫描上限，token 与金额拆分只覆盖最近的部分。 */
+  todayLogsPartial?: boolean
   totalTokens?: TokenBuckets
   /** 今日按模型拆分。 */
   todayModels?: TodayModelRow[]
