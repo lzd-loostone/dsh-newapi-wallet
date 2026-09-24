@@ -1,7 +1,7 @@
 /**
  * 离线端到端验证：不启动 DSH，用最小假 Cordis 上下文加载构建好的 lib/index.js，
- * 走完「settings 注册 → 解析访问令牌 → 打真实网关 → 回环路由出账本」全链路。
- * 令牌只从环境变量 DSH_TEST_TOKEN 读取，绝不写盘、绝不打印。
+ * 走完「Config（volatile）→ settings.describe() 解析路由 → 解析访问令牌 → 打真实网关
+ * → 回环路由出账本」全链路。令牌只从环境变量 DSH_TEST_TOKEN 读取，绝不写盘、绝不打印。
  */
 import { pathToFileURL } from 'node:url'
 import path from 'node:path'
@@ -9,6 +9,8 @@ import path from 'node:path'
 const TOKEN = process.env.DSH_TEST_TOKEN
 const ORIGIN = process.env.DSH_TEST_ORIGIN
 const ROUTE = process.env.DSH_TEST_ROUTE || 'test-route'
+// 站点根（去掉 /v1 之类路径）：账本接口都挂在站点根上。
+const GATEWAY_ORIGIN = new URL(ORIGIN ?? 'http://127.0.0.1').origin
 if (typeof TOKEN !== 'string' || TOKEN === '' || typeof ORIGIN !== 'string' || ORIGIN === '') {
   console.log('usage: DSH_TEST_TOKEN=<access token> DSH_TEST_ORIGIN=<gateway base URL> [DSH_TEST_ROUTE=<route>] node test/harness.mjs')
   process.exit(2)
@@ -21,34 +23,59 @@ if (typeof TOKEN !== 'string' || TOKEN === '') { console.log('缺少 DSH_TEST_TO
 const HERE = path.dirname(new URL(import.meta.url).pathname).replace(/^\/(\w:)/, '$1')
 const bundle = await import(pathToFileURL(path.join(HERE, '..', 'lib', 'index.js')).href)
 
-const registered = {}
 let walletHandler = null
 const logs = []
-const llmProfile = { providers: { [ROUTE]: { baseURL: ORIGIN, apiKeyEnv: KEY_ENV } } }
-
-const fakeSettings = {
-  register(ns, schema, options) {
-    if (typeof schema !== 'function') throw new TypeError('schema is not a function')
-    registered[ns] = { schema, options }
-    return {
-      get() { return schema({ ...options?.base, accessToken: TOKEN, routeAccessTokens: { [ROUTE]: TOKEN }, refreshMs: 15000 }) },
-      update() { return Promise.resolve() },
-      watch() { return () => {} },
-    }
+const updates = []
+const DEAD_ROUTE = 'not-newapi'
+// 探不出 New API 的站点（端口 1 必拒连）：必须被过滤掉，不许出现在卡片列表里。
+const DEAD_ORIGIN = 'http://127.0.0.1:1'
+const llmProfile = {
+  providers: {
+    [ROUTE]: { baseURL: ORIGIN, apiKeyEnv: KEY_ENV },
+    [DEAD_ROUTE]: { baseURL: DEAD_ORIGIN, apiKeyEnv: KEY_ENV },
   },
-  get(ns) { return ns === SETTINGS_NS ? llmProfile : undefined },
+}
+
+// 0.1.7 的 settings 服务：没有 register/get，只有 describe()，返回各 profile 条目（ns = 条目 id）
+// 的实时值。插件必须靠它读到别的插件的 baseURL；写值走 update(ns, patch)。
+// 本插件条目在 profile patch 里的存活值。settings.update 稀疏合并进这里：
+// 官方语义见 dsh-settings 的 mergeLayers（纯对象递归合并，稀疏 patch 不会抹掉下层键），
+// 假上下文照抄，断言才测的是真契约而不是自造的假设。
+const ENTRY_ID = 'loostone-newapi-wallet'
+const liveConfig = { [ENTRY_ID]: { accessToken: TOKEN, routeAccessTokens: { [ROUTE]: TOKEN }, refreshMs: 15000 } }
+const fakeSettings = {
+  describe() {
+    return [
+      { ns: SETTINGS_NS, value: llmProfile },
+      { ns: 'agent-default-model', value: { provider: ROUTE, model: 'test-model' } },
+    ]
+  },
+  async update(ns, patch) {
+    updates.push({ ns, patch })
+    const under = liveConfig[ns] ?? {}
+    const merged = { ...under }
+    for (const [key, value] of Object.entries(patch)) {
+      const nested = value !== null && typeof value === 'object' && !Array.isArray(value)
+      merged[key] = nested && typeof under[key] === 'object' && under[key] !== null
+        ? { ...under[key], ...value }
+        : value
+    }
+    liveConfig[ns] = merged
+  },
 }
 
 const ctx = {
   get(name) {
     if (name === 'settings') return fakeSettings
-    if (name === 'llm') return { listConfigurableProviders: () => [{ provider: ROUTE, displayName: ROUTE, settingsNs: SETTINGS_NS, settingsPath: ['providers', ROUTE] }] }
+    if (name === 'llm') return { listConfigurableProviders: () => [
+      { provider: ROUTE, displayName: ROUTE, settingsNs: SETTINGS_NS, settingsPath: ['providers', ROUTE] },
+      { provider: DEAD_ROUTE, displayName: DEAD_ROUTE, settingsNs: SETTINGS_NS, settingsPath: ['providers', DEAD_ROUTE] },
+    ] }
     if (name === 'credentials') return { resolve: async () => FAKE_SK }
     return undefined
   },
   inject(list, cb) {
     // 真实 Cordis 的形状：inject 把名单里的服务作为属性投递进 scoped 上下文。
-    // 之前这里无条件塞 webServer 又靠 ctx.get 取 settings，反而把「用 ctx.get 取服务」的时序 bug 掩盖了。
     const scoped = { ...ctx, effect: (fn) => { fn(); return () => {} } }
     if (Array.isArray(list) && list.includes('settings')) scoped.settings = fakeSettings
     if (Array.isArray(list) && list.includes('webServer')) scoped.webServer = { register(route) { walletHandler = route.handler; return () => {} } }
@@ -59,15 +86,29 @@ const ctx = {
   logger(key) { return { info: (m, ...a) => logs.push(['info', key, String(m)]), warn: (m, ...a) => logs.push(['warn', key, String(m)]) } },
 }
 
-bundle.apply(ctx, {})
-// 回归断言：命名空间必须真的注册上。宿主 settings.describe() 不过滤任何 ns，
-// 注册成功就会被服务，设置页的插件卡片才会被分发；没注册上说明取服务的方式又是错的。
-if (registered['newapi-wallet'] === undefined) {
-  console.log('  ✗ settings 命名空间 newapi-wallet 未注册 → 设置页卡片必然不出现')
-  console.log('  logger:', JSON.stringify(logs))
-  process.exit(1)
+// 真运行时 apply() 收到的 volatile 字段是 Volatile 引用（读快照用 .get()），照原样喂进来。
+bundle.apply(ctx, {
+  accessToken: { get: () => TOKEN },
+  routeAccessTokens: { get: () => ({ [ROUTE]: TOKEN }) },
+  refreshMs: { get: () => 15000 },
+})
+// 回归断言：0.1.7 的设置页表单来自插件导出的 Config，且宿主只投影 volatile 字段
+// （dsh-settings 的 volatileForm()）。少了 .volatile() → describe() 里没有本条目 →
+// 设置页连填令牌的地方都没有。
+{
+  const json = typeof bundle.Config?.toJSON === 'function' ? bundle.Config.toJSON() : undefined
+  // schemastery 的 toJSON 是 refs 表：根节点按 uid 索引，字段值是 refs 的下标。
+  const refs = json?.refs ?? {}
+  const root = refs[json?.uid] ?? json
+  const dict = root?.dict ?? {}
+  const field = (name) => { const v = dict[name]; return typeof v === 'number' ? refs[v] : v }
+  const missing = ['accessToken', 'routeAccessTokens', 'refreshMs'].filter(name => field(name)?.meta?.volatile !== true)
+  if (missing.length > 0) {
+    console.log('  ✗ Config 缺 .volatile()：' + missing.join(', ') + ' → 设置页不会出现本条目')
+    process.exit(1)
+  }
+  console.log('  ✓ Config 三个字段都是 volatile（设置页可编辑）')
 }
-console.log('  ✓ settings 命名空间已注册（设置页卡片可被分发）')
 console.log('  apply() 后 logger 输出:')
 for (const l of logs) console.log('    ', l.join(' | '))
 if (!walletHandler) { console.log('  ✗ 没有捕获到路由 handler'); process.exit(1) }
@@ -119,6 +160,12 @@ if (w.generatedAt) console.log('    generatedAt =', w.generatedAt)
 
 console.log('\n  --- 安全与接线断言 ---')
 const leaks = []
+// 卡片列表只列探出来是 New API 的路由：DEAD_ROUTE 必须被隐藏。
+{
+  const routes = (payload.accounts ?? []).map(a => a.route)
+  if (routes.length === 1 && routes[0] === ROUTE) console.log('    ✓ 非 New API 路由已过滤（只列 ' + ROUTE + '，' + DEAD_ROUTE + ' 已隐藏）')
+  else leaks.push('供应商过滤不对：' + JSON.stringify(routes) + '（期望只剩 ' + ROUTE + '）')
+}
 // refreshMs 必须由宿主按设置解析后随 payload 下发（假上下文里填的是 15000，落在 [10s,10min] 内）。
 // 这条断言防的是历史上那个真缺陷：客户端用写死的 45s，设置里的 refreshMs 全链路无人读取。
 if (payload.refreshMs === 15000) console.log('    ✓ 宿主按设置下发 refreshMs = 15000')
@@ -154,9 +201,10 @@ else leaks.push('refreshMs 未按设置下发（得到 ' + JSON.stringify(payloa
   if (!yp || yp.available !== true || typeof yp.amount?.display !== 'number') leaks.push('昨日热力格无数据')
   else {
     const s0 = Math.floor(y.getTime() / 1000)
-    const stJson = await fetch(ORIGIN + '/api/log/self/stat?type=2&start_timestamp=' + s0 + '&end_timestamp=' + (s0 + 86400), { headers: { authorization: 'Bearer ' + TOKEN, accept: 'application/json' } }).then(r => r.json())
+    const stJson = await fetch(GATEWAY_ORIGIN + '/api/log/self/stat?type=2&start_timestamp=' + s0 + '&end_timestamp=' + (s0 + 86400), { headers: { authorization: 'Bearer ' + TOKEN, accept: 'application/json' } }).then(r => r.json())
     const stQ = stJson?.data?.quota
-    if (typeof stQ === 'number' && Math.abs(stQ - yp.quota) > 1) leaks.push('昨日热力值(' + yp.quota + ') != stat(' + stQ + ')')
+    if (typeof stQ !== 'number') console.log('    ⓘ 昨日 stat 没返回 quota，跳过对比（热力格 quota=' + yp.quota + '）')
+    else if (Math.abs(stQ - yp.quota) > 1) leaks.push('昨日热力值(' + yp.quota + ') != stat(' + stQ + ')')
     else console.log('    ✓ 热力图昨日 == stat 昨日 (' + stQ + ')')
   }
   const tp = hist[hist.length - 1]
@@ -168,4 +216,56 @@ if (/"authorization"/i.test(ok.body)) leaks.push('响应体含 authorization 字
 if (ok.body.includes(FAKE_SK)) leaks.push('响应体含模型调用密钥')
 if (ok.body.length > 60000) leaks.push('响应体过大(' + ok.body.length + ')')
 console.log(leaks.length ? '    ✗ ' + leaks.join('; ') : '    ✓ 响应体不含令牌 / 不含 sk- 密钥 / 无凭据头，体积 ' + ok.body.length + ' 字节')
+
+console.log('\n  --- 写令牌：POST /api/newapi-wallet ---')
+function postCall(body, headers) {
+  const buf = Buffer.from(body, 'utf8')
+  return call({
+    method: 'POST',
+    url: '/api/newapi-wallet',
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { host: '127.0.0.1:3080', 'content-type': 'application/json', ...(headers ?? {}) },
+    [Symbol.asyncIterator]: async function* () { yield buf },
+  })
+}
+{
+  const ROUTE_TOKEN = 'tok-not-a-real-token'
+  const w1 = await postCall(JSON.stringify({ route: ROUTE, accessToken: ROUTE_TOKEN }))
+  const u1 = updates[updates.length - 1]
+  if (w1.status === 200 && JSON.parse(w1.body).ok === true
+    && u1?.ns === ENTRY_ID && u1?.patch?.routeAccessTokens?.[ROUTE] === ROUTE_TOKEN
+    && liveConfig[ENTRY_ID].routeAccessTokens[ROUTE] === ROUTE_TOKEN) {
+    console.log('    ✓ 按路由写令牌：200，settings.update("' + ENTRY_ID + '", {routeAccessTokens:{' + ROUTE + ':…}})')
+  } else leaks.push('按路由写令牌失败：status=' + w1.status + ' body=' + w1.body + ' update=' + JSON.stringify(u1) + ' live=' + JSON.stringify({ ...liveConfig[ENTRY_ID], accessToken: '…' }))
+
+  const w2 = await postCall(JSON.stringify({ accessToken: 'global-not-a-real-token' }))
+  const u2 = updates[updates.length - 1]
+  // 稀疏 patch 必须只动 accessToken：已有的按路由覆盖与 refreshMs 不能被抹掉。
+  if (w2.status === 200 && u2?.patch?.accessToken === 'global-not-a-real-token'
+    && liveConfig[ENTRY_ID].accessToken === 'global-not-a-real-token'
+    && liveConfig[ENTRY_ID].routeAccessTokens[ROUTE] === ROUTE_TOKEN
+    && liveConfig[ENTRY_ID].refreshMs === 15000) {
+    console.log('    ✓ 写全局默认令牌：只动 accessToken，按路由覆盖与 refreshMs 都还在')
+  } else leaks.push('写全局令牌失败：' + w2.body + ' update=' + JSON.stringify(u2) + ' live=' + JSON.stringify({ ...liveConfig[ENTRY_ID], accessToken: '…' }))
+
+  const w3 = await postCall('{}')
+  if (w3.status === 400) console.log('    ✓ 空 body → 400 bad-request')
+  else leaks.push('空 body 应 400，得到 ' + w3.status)
+
+  const w4 = await postCall(JSON.stringify({ accessToken: 'x' }), { 'content-type': 'text/plain' })
+  if (w4.status === 415) console.log('    ✓ 非 JSON content-type → 415 unsupported-media-type')
+  else leaks.push('非 JSON content-type 应 415，得到 ' + w4.status)
+
+  const w5 = await postCall(JSON.stringify({ accessToken: 'x' }), { origin: 'https://evil.example' })
+  if (w5.status === 403) console.log('    ✓ 外站 Origin → 403 forbidden')
+  else leaks.push('外站 Origin 应 403，得到 ' + w5.status)
+
+  const w6 = await postCall(JSON.stringify({ accessToken: 'x' }), { origin: 'http://127.0.0.1:3080' })
+  if (w6.status === 200) console.log('    ✓ 本机 Origin → 放行')
+  else leaks.push('本机 Origin 应放行，得到 ' + w6.status)
+
+  if ([w1, w2, w6].some(r => r.body.includes(ROUTE_TOKEN) || r.body.includes('global-not-a-real-token'))) leaks.push('写响应回显了令牌')
+  else console.log('    ✓ 写响应不回显令牌')
+}
+if (leaks.length > 0) console.log('\n  ✗ 汇总失败项：\n    - ' + leaks.join('\n    - '))
 process.exit(leaks.length ? 1 : 0)

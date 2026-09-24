@@ -1,19 +1,16 @@
 /**
- * 侧边栏左下角入口：与「用量账本」同槽，点击弹出站点真实账本（今日实扣、
- * 按模型拆分带金额、输入/输出/缓存分桶金额、逐条明细），另在设置页注册
- * newapi-wallet 卡片填访问令牌。
- * 金额一律人民币（¥）；访问令牌只写入设置，不出现在任何展示或日志里。
+ * 侧边栏左下角入口：与「用量账本」同槽。点击弹出站点真实账本（今日实扣、
+ * 按模型拆分带金额、输入/输出/缓存分桶金额、逐条明细），顶部是已配置的
+ * New API 供应商卡片，令牌就在卡片里配置——不再依赖设置页的任何座位。
+ * 金额一律人民币（¥）；访问令牌只经回环 POST 写进宿主 Config，永不回传浏览器。
+ *
+ * 本模块刻意不 import 任何 Harness Client 包：0.1.7 改过 primitives 的图标导出名，
+ * 那次改名让整个座位被 retire。图标与「点外面收起」都自己实现。
  */
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import {
-  IconApiOutline14,
-  IconCloseOutline16,
-  IconRefreshOutline14,
-  useDismissOnOutsidePointer,
-} from '@deepseek-ai/dsh-client-ui-primitives'
 import type {
   AccountListItem,
   CallRecord,
@@ -31,7 +28,6 @@ import type {
 type SeatProps = PropsRuntime<'sidebar.footer.action'>
 
 const PATH = '/api/newapi-wallet'
-const NS = 'newapi-wallet'
 const LOGGER_KEY = 'loostone-newapi-wallet'
 const DEFAULT_REFRESH_MS = 45_000
 const STYLE_ID = 'loostone-newapi-wallet/panel.css'
@@ -86,36 +82,35 @@ const CSS = [
   '.gww_ok{color:var(--dsw-alias-state-success-primary)}',
   '.gww_footer{color:var(--dsw-alias-label-caption);border-top:1px solid var(--dsw-alias-border-l1);margin-top:14px;padding-top:8px;font-size:11px;line-height:16px;font-variant-numeric:tabular-nums}',
   '.gww_retry{color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;margin-top:8px;padding:3px 10px;font:inherit;font-size:12px}',
-  '.gww_picker{display:flex;align-items:center;gap:8px;margin:0 0 12px}',
-  '.gww_pickerLabel{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;flex:none}',
-  '.gww_select{flex:1;min-width:0;color:var(--dsw-alias-label-secondary);background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:4px 6px;font:inherit;font-size:12px}',
-  '.gww_select:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}',
+  '.gww_cards{display:flex;gap:8px;overflow-x:auto;overscroll-behavior-x:contain;padding:0 0 8px;margin:0 0 10px;scrollbar-width:thin}',
+  '.gww_card{flex:0 0 auto;min-width:136px;max-width:200px;display:flex;flex-direction:column;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-3);overflow:hidden}',
+  '.gww_card[data-active]{border-color:var(--dsw-alias-label-tertiary)}',
+  '.gww_cardPick{cursor:pointer;text-align:left;color:inherit;background:0 0;border:none;padding:8px 10px 6px;font-family:inherit;display:flex;flex-direction:column;gap:2px;min-width:0}',
+  '.gww_cardPick:focus-visible{outline:none;box-shadow:inset 0 0 0 2px var(--dsw-alias-border-l1)}',
+  '.gww_cardName{color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+  '.gww_cardHost{color:var(--dsw-alias-label-caption);font-size:11px;line-height:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+  '.gww_cardState{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px}',
+  '.gww_cardState[data-ok]{color:var(--dsw-alias-state-success-primary)}',
+  '.gww_cardConfig{cursor:pointer;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover);border:none;border-top:1px solid var(--dsw-alias-border-l1);padding:4px 10px;font:inherit;font-size:11px;line-height:16px}',
+  '.gww_cardConfig:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover-solid)}',
+  '.gww_dialogLayer{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;padding:16px;background:rgb(0 0 0 / .32)}',
+  '.gww_dialog{box-sizing:border-box;width:320px;max-width:100%;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-overlay,Canvas);border-radius:12px;box-shadow:var(--dsw-shadow-lv2);padding:14px}',
+  '.gww_dialogTitle{color:var(--dsw-alias-label-primary);font-size:13px;font-weight:500;line-height:20px;margin:0 0 6px}',
+  '.gww_fieldLabel{display:block;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;margin:10px 0 4px}',
+  '.gww_input{box-sizing:border-box;width:100%;color:var(--dsw-alias-label-primary);background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:6px 8px;font:inherit;font-size:12px}',
+  '.gww_input:focus{outline:none;border-color:var(--dsw-alias-label-tertiary)}',
+  '.gww_scopeRow{display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;margin-top:8px;cursor:pointer}',
+  '.gww_dialogActions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}',
+  '.gww_dialogActions .gww_retry{margin-top:0}',
+  '.gww_primary{cursor:pointer;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:4px 14px;font:inherit;font-size:12px}',
+  '.gww_primary:hover{background:var(--dsw-alias-interactive-bg-hover-solid)}',
+  '.gww_primary[data-busy]{opacity:.5;cursor:default}',
   '.gww_call{border-bottom:1px solid var(--dsw-alias-border-l1);padding:6px 0}',
   '.gww_call:last-child{border-bottom:0}',
   '.gww_callHead{display:flex;justify-content:space-between;gap:8px;font-size:12px;line-height:18px}',
   '.gww_callModel{color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
   '.gww_callAmount{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;flex:none}',
   '.gww_callMeta{color:var(--dsw-alias-label-caption);font-size:11px;line-height:16px;margin-top:2px;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-  '.gww_card{list-style:none;display:block;margin:0;background:var(--dsw-alias-bg-layer-3);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;transition:border-color .2s ease}',
-  '.gww_card:hover{border-color:var(--dsw-alias-border-l1)}',
-  '.gww_cardHead{cursor:pointer;text-align:left;color:inherit;background:0 0;border:none;border-radius:8px;width:100%;align-items:center;gap:8px;padding:8px 10px;font-family:inherit;font-size:13px;display:flex}',
-  '.gww_cardHead:focus-visible{outline:none;box-shadow:0 0 0 2px var(--dsw-alias-border-l2)}',
-  '.gww_cardHeadText{flex:1;min-width:0;display:block}',
-  '.gww_cardHeadTitle{color:var(--dsw-alias-label-primary);font-weight:500;line-height:18px;display:block}',
-  '.gww_cardHeadNote{color:var(--dsw-alias-label-caption);font-size:11px;line-height:16px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-  '.gww_cardChevron{flex:none;width:0;height:0;border-top:4px solid transparent;border-bottom:4px solid transparent;border-left:4px solid var(--dsw-alias-label-tertiary);transition:transform .2s ease}',
-  '.gww_card-open .gww_cardChevron{transform:rotate(90deg)}',
-  '.gww_cardBody{display:none;padding:0 10px 10px;border-top:1px solid var(--dsw-alias-border-l1)}',
-  '.gww_card-open .gww_cardBody{display:block;padding-top:8px}',
-  '.gww_cardTitle{color:var(--dsw-alias-label-primary);font-size:13px;font-weight:500;line-height:20px;margin:0 0 4px}',
-  '.gww_cardIntro{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;margin:0 0 8px}',
-  '.gww_fieldLabel{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;margin:8px 0 4px;display:block}',
-  '.gww_input{box-sizing:border-box;width:100%;color:var(--dsw-alias-label-primary);background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:6px 8px;font:inherit;font-size:12px}',
-  '.gww_input:focus{outline:none;border-color:var(--dsw-alias-border-l1)}',
-  '.gww_save{cursor:pointer;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;margin-top:10px;padding:5px 14px;font:inherit;font-size:12px}',
-  '.gww_save[data-busy]{opacity:.5;cursor:default}',
-  '.gww_save[data-done]{color:var(--dsw-alias-state-success-primary)}',
-  '.gww_inputError{color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:16px;margin:4px 0 0}',
   '.gww_heat{--gww-heat:#31a06b;display:flex;flex-direction:column;gap:6px}',
   '.gww_heat{--h0:var(--dsw-alias-bg-layer-3);--h1:#9be9a8;--h1:light-dark(#9be9a8,#0e4429);--h2:#40c463;--h2:light-dark(#40c463,#006d32);--h3:#30a14e;--h3:light-dark(#30a14e,#26a641);--h4:#216e39;--h4:light-dark(#216e39,#39d353)}',
   '.gww_heat{--t1:light-dark(#14532d,#d6f5e2);--t2:light-dark(#0b3a20,#eafff2);--t3:#062d16;--t4:light-dark(#ffffff,#052411)}',
@@ -205,11 +200,66 @@ function hostOf(origin: string): string {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* 图标：内联 SVG，不依赖任何 Harness Client 包                            */
+/* ------------------------------------------------------------------ */
+
+function IconWallet({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="1.75" y="3.25" width="12.5" height="9.5" rx="2" stroke="currentColor" strokeWidth="1.2" />
+      <path d="M1.75 6.5h12.5" stroke="currentColor" strokeWidth="1.2" />
+      <circle cx="11.25" cy="9.75" r="1" fill="currentColor" />
+    </svg>
+  )
+}
+
+function IconRefresh({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M13 8a5 5 0 1 1-1.47-3.54" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+      <path d="M13.6 2.6v3.2h-3.2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function IconClose({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+/* ------------------------------------------------------------------ */
+/* 取数：GET 读账本，POST 写令牌（都走本机回环路由）                        */
+/* ------------------------------------------------------------------ */
+
 async function loadWallet(route: string | undefined, signal: AbortSignal): Promise<WalletPayload> {
   const query = route !== undefined && route !== '' ? `?route=${encodeURIComponent(route)}` : ''
   const response = await fetch(PATH + query, { headers: { accept: 'application/json' }, signal })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
   return response.json() as Promise<WalletPayload>
+}
+
+/** 写令牌。route 缺省 = 写全局默认令牌，否则只写这条路由的覆盖。 */
+async function saveAccessToken(body: { route?: string; accessToken: string }): Promise<void> {
+  const response = await fetch(PATH, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (response.ok) return
+  const payload = await response.json().catch(() => undefined) as WalletError | undefined
+  throw new Error(payload?.detail ?? saveErrorCopy(payload?.error))
+}
+
+function saveErrorCopy(error: string | undefined): string {
+  if (error === 'no-settings') return '设置服务不可用，暂时存不了令牌。'
+  if (error === 'settings-write-failed') return '写入设置文件失败。'
+  if (error === 'forbidden') return '请求来源不被信任，已拒绝。'
+  if (error === 'unsupported-media-type' || error === 'bad-request') return '请求格式不对。'
+  return error !== undefined && error !== '' ? `保存失败：${error}` : '保存失败。'
 }
 
 function isBundle(value: WalletPayload | undefined): value is WalletBundle {
@@ -221,50 +271,149 @@ function isWalletError(value: WalletPayload | undefined): value is WalletError {
 }
 
 function walletErrorCopy(error: string): string {
-  if (error === 'no-access-token') return '请在设置里填入 New API 访问令牌（设置 → 插件 → New API 账本）。'
+  if (error === 'no-access-token') return '这条供应商还没配访问令牌。点卡片上的「配置令牌」填一个。'
   if (error === 'unknown-account') return '名单里没有这条路由。'
   if (error === 'no-provider') return '还没有配置带地址的模型路由。'
-  if (error === 'unknown-software') return '认不出这个站跑的是哪套账本，不会硬猜数字。'
-  if (error === 'scheme-unsupported') return '这个站点不是 New API，本插件不支持。'
-  if (error === 'unsupported-official') return 'DeepSeek 官方站点不在本插件支持范围。'
+  if (error === 'no-newapi') return '已配置的模型路由里没有一条是 New API 站点。'
   if (error === 'timeout' || error === 'unreachable') return '连不上站点。'
   if (error === 'internal' || error === 'unexpected response') return '本机读取出错。'
   return `账本：${error}`
 }
 
-function AccountPicker({
+/** 点面板外面就收起。自己实现，省掉 primitives 依赖。 */
+function useDismissOnOutsidePointer(
+  ref: React.RefObject<HTMLElement | null>,
+  open: boolean,
+  close: () => void,
+): void {
+  const closeRef = useRef(close)
+  closeRef.current = close
+  useEffect(() => {
+    if (!open || typeof document === 'undefined') return undefined
+    const onPointer = (event: Event): void => {
+      const node = ref.current
+      const target = event.target as Node | null
+      if (node === null || target === null || node.contains(target)) return
+      closeRef.current()
+    }
+    document.addEventListener('pointerdown', onPointer, true)
+    return () => document.removeEventListener('pointerdown', onPointer, true)
+  }, [ref, open])
+}
+
+/* ------------------------------------------------------------------ */
+/* 供应商卡片：横向滚动，每张卡自己配令牌                                  */
+/* ------------------------------------------------------------------ */
+
+function AccountCards({
   accounts,
   selected,
   onSelect,
+  onConfigure,
 }: {
   accounts: AccountListItem[]
   selected: string
   onSelect: (route: string) => void
+  onConfigure: (route: string) => void
 }) {
-  if (accounts.length <= 1) return null
+  if (accounts.length === 0) return null
   return (
-    <label className="gww_picker">
-      <span className="gww_pickerLabel">账户</span>
-      <select
-        className="gww_select"
-        value={selected}
-        onChange={event => onSelect(event.target.value)}
-      >
-        {accounts.map(account => {
-          const bits = [
-            account.displayName,
-            account.isCurrent ? '当前' : undefined,
-            account.hasAccessKey ? '令牌已配' : '无令牌',
-            account.host,
-          ].filter(value => value !== undefined && value !== '')
-          return (
-            <option key={account.route} value={account.route}>
-              {bits.join(' · ')}
-            </option>
-          )
-        })}
-      </select>
-    </label>
+    <div className="gww_cards" role="tablist" aria-label="New API 供应商">
+      {accounts.map(account => (
+        <div
+          key={account.route}
+          className="gww_card"
+          {...account.route === selected ? { 'data-active': '' } : {}}
+        >
+          <button
+            type="button"
+            role="tab"
+            className="gww_cardPick"
+            aria-selected={account.route === selected}
+            onClick={() => onSelect(account.route)}
+          >
+            <span className="gww_cardName">{account.displayName}</span>
+            <span className="gww_cardHost">{account.host}</span>
+            <span className="gww_cardState" {...account.hasAccessKey ? { 'data-ok': '' } : {}}>
+              {account.hasAccessKey ? '令牌已配' : '未配令牌'}
+              {account.isCurrent ? ' · 当前' : ''}
+            </span>
+          </button>
+          <button type="button" className="gww_cardConfig" onClick={() => onConfigure(account.route)}>
+            {account.hasAccessKey ? '改令牌' : '配置令牌'}
+          </button>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/** 令牌弹窗：填/改这条供应商的访问令牌，或存成全局默认。 */
+function TokenDialog({
+  account,
+  saving,
+  failure,
+  onSave,
+  onClose,
+}: {
+  account: AccountListItem
+  saving: boolean
+  failure: string | undefined
+  onSave: (token: string, scope: 'route' | 'global') => void
+  onClose: () => void
+}) {
+  const [token, setToken] = useState('')
+  const [scope, setScope] = useState<'route' | 'global'>('route')
+  const input = useRef<HTMLInputElement>(null)
+  useEffect(() => { input.current?.focus() }, [])
+  const submit = (): void => {
+    if (!saving) onSave(token.trim(), scope)
+  }
+  return (
+    <div
+      className="gww_dialogLayer"
+      role="presentation"
+      onPointerDown={event => { if (event.target === event.currentTarget) onClose() }}
+    >
+      <div className="gww_dialog" role="dialog" aria-modal="true" aria-label={`配置 ${account.displayName} 的访问令牌`}>
+        <div className="gww_dialogTitle">配置访问令牌</div>
+        <p className="gww_note">
+          New API「访问令牌」，在站点用户中心生成——不是 sk- 模型密钥。保存后立即生效，不用重启。
+        </p>
+        <label className="gww_fieldLabel" htmlFor="gww_token">访问令牌</label>
+        <input
+          id="gww_token"
+          ref={input}
+          type="password"
+          className="gww_input"
+          value={token}
+          autoComplete="off"
+          placeholder={account.hasAccessKey ? '••••••••（留空保存即清除）' : '粘贴访问令牌'}
+          onChange={event => setToken(event.target.value)}
+          onKeyDown={event => { if (event.key === 'Enter') submit() }}
+        />
+        <label className="gww_scopeRow">
+          <input type="radio" name="gww_scope" checked={scope === 'route'} onChange={() => setScope('route')} />
+          只用于 {account.displayName}
+        </label>
+        <label className="gww_scopeRow">
+          <input type="radio" name="gww_scope" checked={scope === 'global'} onChange={() => setScope('global')} />
+          作为所有供应商的默认令牌
+        </label>
+        {failure !== undefined && <p className="gww_error">{failure}</p>}
+        <div className="gww_dialogActions">
+          <button type="button" className="gww_retry" onClick={onClose}>取消</button>
+          <button
+            type="button"
+            className="gww_primary"
+            {...saving ? { 'data-busy': '' } : {}}
+            onClick={submit}
+          >
+            {saving ? '保存中…' : '保存'}
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -507,6 +656,7 @@ function WalletBody({
   selected,
   loading,
   onSelect,
+  onConfigure,
   onRetry,
 }: {
   snapshot: WalletSnapshot | undefined
@@ -517,15 +667,21 @@ function WalletBody({
   selected: string
   loading: 'block' | 'dim' | false
   onSelect: (route: string) => void
+  onConfigure: (route: string) => void
   onRetry: () => void
 }) {
-  const picker = (
-    <AccountPicker accounts={accounts} selected={selected} onSelect={onSelect} />
+  const cards = (
+    <AccountCards
+      accounts={accounts}
+      selected={selected}
+      onSelect={onSelect}
+      onConfigure={onConfigure}
+    />
   )
   if (loading === 'block') {
     return (
       <div>
-        {picker}
+        {cards}
         <p className="gww_note">读取中…</p>
       </div>
     )
@@ -533,7 +689,7 @@ function WalletBody({
   if (snapshot === undefined && fail !== undefined) {
     return (
       <div>
-        {picker}
+        {cards}
         <div className="gww_fail">
           <p className="gww_warn">{fail.title}</p>
           {fail.note !== undefined && <p className="gww_note">{fail.note}</p>}
@@ -545,7 +701,7 @@ function WalletBody({
   if (error !== undefined && snapshot === undefined) {
     return (
       <div>
-        {picker}
+        {cards}
         <p className="gww_error">读不到账本。</p>
         <p className="gww_note">{error}</p>
         <button type="button" className="gww_retry" onClick={onRetry}>重试</button>
@@ -555,7 +711,7 @@ function WalletBody({
   if (wallet?.ok === false && snapshot === undefined) {
     return (
       <div>
-        {picker}
+        {cards}
         <p className="gww_warn">{walletErrorCopy(wallet.error)}</p>
         {wallet.detail !== undefined && <p className="gww_note">{wallet.detail}</p>}
         <button type="button" className="gww_retry" onClick={onRetry}>重试</button>
@@ -565,7 +721,7 @@ function WalletBody({
   if (snapshot === undefined) {
     return (
       <div>
-        {picker}
+        {cards}
         <p className="gww_note">读取中…</p>
       </div>
     )
@@ -577,7 +733,7 @@ function WalletBody({
 
   return (
     <div>
-      {picker}
+      {cards}
       {fail !== undefined && (
         <div className="gww_fail">
           <p className="gww_warn">{fail.title}</p>
@@ -662,6 +818,9 @@ function WalletSeat({ wide, useSessions }: SeatProps) {
   const [pending, setPending] = useState<'switch' | 'manual' | 'auto' | undefined>(undefined)
   const [anchor, setAnchor] = useState<{ left: number; bottom: number } | undefined>(undefined)
   const [badgeValue, setBadgeValue] = useState('')
+  const [tokenRoute, setTokenRoute] = useState<string | undefined>(undefined)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | undefined>(undefined)
   const [lastGood, setLastGood] = useState<Record<string, WalletSnapshot>>({})
   const lastGoodRef = useRef(lastGood)
   lastGoodRef.current = lastGood
@@ -737,16 +896,19 @@ function WalletSeat({ wide, useSessions }: SeatProps) {
     return () => clearTimeout(timer)
   }, [running])
 
-  useDismissOnOutsidePointer(root, open, setOpen)
+  useDismissOnOutsidePointer(root, open, () => setOpen(false))
 
   useEffect(() => {
     if (!open) return undefined
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') setOpen(false)
+      if (event.key !== 'Escape') return
+      // 令牌弹窗开着时，Esc 先关弹窗，别把整个面板一起收掉。
+      if (tokenRoute !== undefined) setTokenRoute(undefined)
+      else setOpen(false)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [open])
+  }, [open, tokenRoute])
 
   useLayoutEffect(() => {
     if (!open) return undefined
@@ -795,6 +957,35 @@ function WalletSeat({ wide, useSessions }: SeatProps) {
     setNonce(n => n + 1)
   }
 
+  const openTokenDialog = (route: string): void => {
+    setSaveError(undefined)
+    setTokenRoute(route)
+  }
+
+  const saveToken = (token: string, scope: 'route' | 'global'): void => {
+    if (tokenRoute === undefined) return
+    setSaving(true)
+    setSaveError(undefined)
+    const body = scope === 'global' ? { accessToken: token } : { route: tokenRoute, accessToken: token }
+    saveAccessToken(body).then(
+      () => {
+        setSaving(false)
+        setTokenRoute(undefined)
+        // 保存后立刻重读：宿主 Config 的 volatile 引用即时生效，不用重启 DSH。
+        setPending('manual')
+        setNonce(n => n + 1)
+      },
+      (err: unknown) => {
+        setSaving(false)
+        setSaveError(err instanceof Error ? err.message : String(err))
+      },
+    )
+  }
+
+  const tokenAccount = tokenRoute !== undefined
+    ? bundle?.accounts.find(account => account.route === tokenRoute)
+    : undefined
+
   return (
     <div ref={root} className={wide === false ? 'gww_layer gww_rail' : 'gww_layer'}>
       <button
@@ -808,7 +999,7 @@ function WalletSeat({ wide, useSessions }: SeatProps) {
         onClick={() => setOpen(value => !value)}
       >
         <span className="gww_badgeIcon">
-          <IconApiOutline14 size={wide === false ? 18 : 14} />
+          <IconWallet size={wide === false ? 18 : 14} />
           {low && <span className="gww_dot" aria-hidden="true" />}
         </span>
         <span className="gww_badgeLabel">New API 账本</span>
@@ -831,7 +1022,7 @@ function WalletSeat({ wide, useSessions }: SeatProps) {
                 aria-label="刷新"
                 onClick={reload}
               >
-                <IconRefreshOutline14 size={14} />
+                <IconRefresh size={14} />
               </button>
               <button
                 type="button"
@@ -839,7 +1030,7 @@ function WalletSeat({ wide, useSessions }: SeatProps) {
                 aria-label="关闭"
                 onClick={() => setOpen(false)}
               >
-                <IconCloseOutline16 size={16} />
+                <IconClose size={16} />
               </button>
             </div>
           </div>
@@ -856,152 +1047,35 @@ function WalletSeat({ wide, useSessions }: SeatProps) {
                 setPending('switch')
                 setInspectRoute(route)
               }}
+              onConfigure={openTokenDialog}
               onRetry={reload}
             />
           </div>
         </div>
       )}
+      {tokenAccount !== undefined && (
+        <TokenDialog
+          account={tokenAccount}
+          saving={saving}
+          failure={saveError}
+          onSave={saveToken}
+          onClose={() => setTokenRoute(undefined)}
+        />
+      )}
     </div>
-  )
-}
-
-/* ------------------------------------------------------------------ */
-/* 设置页卡片：填 New API 访问令牌                                        */
-/* ------------------------------------------------------------------ */
-
-interface SettingsScopeLike {
-  getSnapshot(): {
-    status: string
-    value?: { accessToken?: string }
-    writable: boolean
-  }
-  set(field: string, value: unknown): Promise<unknown>
-}
-
-/** 设置页 → 插件 → New API 账本：写 accessToken / routeAccessTokens / refreshMs。 */
-function SettingsCard({ scope }: { scope: SettingsScopeLike }) {
-  const snapshot = scope.getSnapshot()
-  const [token, setToken] = useState('')
-  const [routeTokens, setRouteTokens] = useState('')
-  const [saving, setSaving] = useState(false)
-  const [saved, setSaved] = useState(false)
-  const [failed, setFailed] = useState(false)
-  const hasToken = (snapshot.value?.accessToken ?? '') !== ''
-  // 折叠态与宿主插件区一致；首次（还没令牌）默认展开，免得用户找不到输入框。
-  const [open, setOpen] = useState(!hasToken)
-  const writable = snapshot.writable === true
-
-  const save = (): void => {
-    if (saving) return
-    setSaving(true)
-    setSaved(false)
-    setFailed(false)
-    const ops: Array<Promise<unknown>> = [scope.set('accessToken', token.trim())]
-    const perRoute: Record<string, string> = {}
-    for (const line of routeTokens.split('\n')) {
-      const cut = line.indexOf('=')
-      if (cut === -1) continue
-      const key = line.slice(0, cut).trim()
-      const value = line.slice(cut + 1).trim()
-      if (key !== '' && value !== '') perRoute[key] = value
-    }
-    ops.push(scope.set('routeAccessTokens', perRoute))
-    Promise.all(ops).then(
-      () => {
-        setSaving(false)
-        setSaved(true)
-        setToken('')
-      },
-      () => {
-        setSaving(false)
-        setFailed(true)
-      },
-    )
-  }
-
-  return (
-    <li className={'gww_card' + (open ? ' gww_card-open' : '')}>
-      <button
-        type="button"
-        className="gww_cardHead"
-        aria-expanded={open}
-        aria-label={`${open ? '收起' : '展开'}：New API 账本`}
-        onClick={() => setOpen(!open)}
-      >
-        <span className="gww_cardHeadText">
-          <span className="gww_cardHeadTitle">New API 账本</span>
-          <span className="gww_cardHeadNote">
-            {hasToken ? '访问令牌已配置' : '未配置访问令牌'}
-            {writable ? '' : ' · 只读（设置文件不可写）'}
-          </span>
-        </span>
-        <span className="gww_cardChevron" aria-hidden="true" />
-      </button>
-      <div className="gww_cardBody">
-        <p className="gww_cardIntro">
-          填 New API「访问令牌」（用户中心生成，不是 sk- 模型密钥）。保存后即时生效，无需重启。
-        </p>
-        <label className="gww_fieldLabel">访问令牌{hasToken ? '（已保存；留空保存即清除）' : ''}</label>
-        <input
-          type="password"
-          className="gww_input"
-          value={token}
-          autoComplete="off"
-          placeholder={hasToken ? '••••••••' : '粘贴访问令牌'}
-          onChange={event => setToken(event.target.value)}
-        />
-        <label className="gww_fieldLabel">按路由覆盖（可选，每行 路由名=令牌）</label>
-        <textarea
-          className="gww_input"
-          rows={3}
-          value={routeTokens}
-          onChange={event => setRouteTokens(event.target.value)}
-        />
-        <button
-          type="button"
-          className="gww_save"
-          {...saving ? { 'data-busy': '' } : saved ? { 'data-done': '' } : {}}
-          onClick={save}
-        >
-          {saving ? '保存中…' : saved ? '已保存' : '保存'}
-        </button>
-        {failed && <p className="gww_inputError">保存失败，请重试。</p>}
-      </div>
-    </li>
   )
 }
 
 export const name = LOGGER_KEY
 export const inject = ['slots']
 
+// 唯一入口就是这个侧边栏座位：不再往设置页插任何座位（0.1.7 已删掉 settingsScope 与
+// settings.plugin.item 两样东西）。宿主仍会把本插件的 Config 投影成设置页表单，那只是
+// 同一份数据的备用视图；正常路径是面板卡片上的「配置令牌」弹窗。
 export function apply(ctx: ClientContext): void {
   ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
     name: 'sidebar.footer.action',
     id: LOGGER_KEY,
     order: 25,
   }, WalletSeat))
-  // 设置页卡片：settingsScope 由 @deepseek-ai/dsh-client-ui-settings 提供（已在 dsh.client.inject
-  // 里声明，故该模块会进图），但它可能比我们晚激活——apply() 那一刻用 ctx.get() 取会恒为 undefined。
-  // 所以用 ctx.inject 声明式等待服务出现，写法对齐同环境已跑通的 dsh-context。
-  // 座位 settings.plugin.item 是 keyed：注册只带 key（= 本插件的设置命名空间），不带 id/order。
-  ctx.inject(['settingsScope'], (scoped) => {
-    const binder = (scoped as unknown as {
-      settingsScope?: { bind?: (spec: { namespace: string }) => SettingsScopeLike }
-    }).settingsScope
-    const bind = binder?.bind
-    if (bind === undefined) return
-    scoped.slots.inject('settings.plugin.item', () => scoped.slots.register({
-      name: 'settings.plugin.item',
-      key: NS,
-    }, () => {
-      const scope = bind.call(binder, { namespace: NS })
-      if (scope === undefined) {
-        return React.createElement('li', { className: 'gww_card' },
-          React.createElement('span', { className: 'gww_cardHeadText' },
-            React.createElement('span', { className: 'gww_cardHeadTitle' }, 'New API 账本'),
-            React.createElement('span', { className: 'gww_cardHeadNote' }, '设置服务不可用。')))
-      }
-      return React.createElement(SettingsCard, { scope })
-    }))
-  })
 }

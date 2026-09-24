@@ -162,4 +162,12 @@ export interface WalletBundle {
   wallet: WalletSnapshot | WalletError
 }
 
+/** 写令牌的应答。成功只回 ok；刷新交给客户端再 GET 一次。 */
+export interface WalletAck {
+  ok: true
+}
+
 export type WalletPayload = WalletBundle | WalletError
+
+/** 回环路由的两种应答：GET 回快照，POST 回 ack。 */
+export type WalletResponse = WalletPayload | WalletAck

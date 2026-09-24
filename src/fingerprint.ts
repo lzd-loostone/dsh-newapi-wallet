@@ -1,115 +1,63 @@
 /**
- * 用不带密钥的探测区分中转站程序。
- * 某条路存在会回 401/200/429，不存在回 404；绝不根据猜测去换算额度。
- * 注意：/api/usage/token 与 /api/log/token 在本公司网关上 429（限流），
- * 只作为「路由存在」的指纹证据，绝不作为轮询数据源。
+ * 只认 New API：GET /api/status 是 New API 账本的公开签名（匿名可访问，不需要任何密钥）。
+ * 2xx 且不是拒绝态（success/code 不为 false）即认定是 New API 站点；其余一律 unknown。
+ * 不探测任何其它中转站程序，也绝不根据猜测去换算额度。
+ * 只缓存认出的结果：一次网络抖动不该让整段会话都判成「不是 New API」。
  */
 
-export type RelaySoftware = 'sub2api' | 'newapi'
-
 export interface Fingerprint {
-  software: RelaySoftware | 'unknown'
+  software: 'newapi' | 'unknown'
+  /** unknown 时给出人话原因，供界面解释「为什么这条路由没出现在卡片里」。 */
   reason?: string
 }
 
 const PROBE_MS = 8_000
-
-/** 非 404 且传输成功，视为这条路存在。429 也算存在。 */
-function exists(status: number | undefined): boolean {
-  return status !== undefined && status !== 404 && status !== 0
-}
-
-const SIGNATURES: Array<{
-  software: RelaySoftware
-  required: string[]
-  absent: string[]
-}> = [
-  {
-    software: 'newapi',
-    required: ['/api/status', '/api/usage/token'],
-    absent: ['/v1/usage'],
-  },
-  {
-    software: 'sub2api',
-    required: ['/v1/usage'],
-    absent: ['/api/status', '/api/usage/token'],
-  },
-]
-
-const PROBE_PATHS = [...new Set(SIGNATURES.flatMap(s => [...s.required, ...s.absent]))]
+const PROBE_PATH = '/api/status'
 
 const cache = new Map<string, Fingerprint>()
 
-async function probeStatus(origin: string, path: string): Promise<number> {
+interface ProbeResult {
+  /** HTTP 状态；0 = 传输失败。 */
+  status: number
+  body: Record<string, unknown>
+}
+
+async function probe(origin: string): Promise<ProbeResult> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), PROBE_MS)
   try {
-    const response = await fetch(new URL(path, origin), {
+    const response = await fetch(new URL(PROBE_PATH, origin), {
       headers: { accept: 'application/json' },
       signal: controller.signal,
     })
-    return response.status
+    const parsed: unknown = await response.json().catch(() => ({}))
+    const body = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {}
+    return { status: response.status, body }
   } catch {
-    return 0
+    return { status: 0, body: {} }
   } finally {
     clearTimeout(timer)
   }
 }
 
-function score(statuses: Record<string, number>): Fingerprint {
-  const hits: Array<{ software: RelaySoftware; agreed: number; total: number }> = []
-  for (const signature of SIGNATURES) {
-    let disqualified = false
-    let agreed = 0
-    let total = 0
-    for (const path of signature.required) {
-      total += 1
-      if (exists(statuses[path])) agreed += 1
-      else disqualified = true
-    }
-    for (const path of signature.absent) {
-      total += 1
-      if (!exists(statuses[path])) agreed += 1
-      else disqualified = true
-    }
-    if (!disqualified) hits.push({ software: signature.software, agreed, total })
+function score({ status, body }: ProbeResult): Fingerprint {
+  if (status === 0) return { software: 'unknown', reason: `连不上站点（${PROBE_PATH}）` }
+  if (status < 200 || status >= 300) {
+    return { software: 'unknown', reason: `站点没有 New API 的 ${PROBE_PATH}（HTTP ${status}）` }
   }
-
-  const summary = Object.entries(statuses)
-    .map(([path, status]) => `${path}=${status === 0 ? '×' : status}`)
-    .join(' ')
-
-  if (hits.length === 0) {
-    const values = Object.values(statuses)
-    if (values.every(status => status === 0)) {
-      return { software: 'unknown', reason: `连不上站点（${summary}）` }
-    }
-    const distinct = new Set(values)
-    if (distinct.size === 1) {
-      return { software: 'unknown', reason: `探测路由都返回 ${[...distinct][0]}，无法区分程序（${summary}）` }
-    }
-    return { software: 'unknown', reason: `没有匹配到已知账本程序（${summary}）` }
+  if (body.success === false || body.code === false) {
+    return { software: 'unknown', reason: `站点拒绝了 ${PROBE_PATH}` }
   }
-
-  hits.sort((a, b) => b.agreed / b.total - a.agreed / a.total)
-  if (hits.length > 1 && hits[0].agreed / hits[0].total === hits[1].agreed / hits[1].total) {
-    return { software: 'unknown', reason: `同时像 ${hits.map(h => h.software).join(' 和 ')}（${summary}）` }
-  }
-  return { software: hits[0].software }
+  return { software: 'newapi' }
 }
 
 /** 按 origin 探测一次并记住。不带 Authorization。 */
 export async function fingerprintOrigin(origin: string): Promise<Fingerprint> {
   const cached = cache.get(origin)
   if (cached !== undefined) return cached
-  const statuses: Record<string, number> = {}
-  await Promise.all(PROBE_PATHS.map(async (path) => {
-    statuses[path] = await probeStatus(origin, path)
-  }))
-  const result = score(statuses)
-  // 只记住认出的程序。连不上或对不上的若也缓存，一次网络抖动就会整段会话都显示「连不上」。
-  if (result.software === 'sub2api' || result.software === 'newapi') {
-    cache.set(origin, result)
-  }
+  const result = score(await probe(origin))
+  if (result.software === 'newapi') cache.set(origin, result)
   return result
 }

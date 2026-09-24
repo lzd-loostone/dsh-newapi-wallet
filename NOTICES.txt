@@ -16,11 +16,14 @@ MIT 许可要求保留上游版权声明与许可全文，本仓库已满足。�
 上游把「模型调用用的 sk- API key」直接当作 New API 用户级路由的 Authorization
 凭据发送。我们内部署的 New API 在 /api/user/self、/api/data/self、
 /api/log/self* 这些路由上要求的是「访问令牌」（个人设置里生成的 access token），
-因此上游在我们的网关上必然返回 401 AUTH_UNAUTHORIZED。本 fork 引入独立的访问
+因此上游在我们的网关上必然返回 401 AUTH_UNAUTHORIZED。本派生版本引入独立的访问
 令牌配置项、修正取数端点集合，并把展示币种按网关自身声明改为人民币。
 
 我们不再跟随上游更新；后续维护由我们自己负责。
 
-本 fork 的改动集中在：凭据来源（settings 命名空间 newapi-wallet）、端点集合、
-金额换算与展示币种、内部标识与回环路由改名（loostone-newapi-wallet /
-/api/newapi-wallet）。
+本派生版本的改动集中在：凭据来源（插件自己导出的 Config，值写在 profile 的
+cordis.patch.yml 里本插件条目 `loostone-newapi-wallet` 下的 accessToken /
+routeAccessTokens / refreshMs，由官方 settings.update 写入）、只认 New API 的
+站点探测（匿名 GET /api/status）、取数端点集合、金额换算与展示币种、内部标识与
+回环路由改名（loostone-newapi-wallet / /api/newapi-wallet），以及 DSH 0.1.7
+契约适配（设置页座位改到侧边栏账本弹窗，客户端不再依赖任何 Harness Client 包）。

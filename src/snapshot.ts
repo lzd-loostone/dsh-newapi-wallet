@@ -42,8 +42,6 @@ const LOG_MAX_PAGES = 10
 const HEAT_DAYS = 28
 /** 缺失日逐日 stat 补探上限（每次 ~80ms）；「今天」豁免预算。超出预算的日期显示「无数据」。 */
 const HEAT_FILL_MAX = 12
-const DEEPSEEK_ORIGIN = 'https://api.deepseek.com'
-const DEEPSEEK_KEY_ENV = 'DEEPSEEK_API_KEY'
 /** /api/status 读不到汇率时的兜底币种：公司网关即 CNY 展示。 */
 const FALLBACK_CURRENCY = 'CNY'
 
@@ -78,18 +76,6 @@ function originOf(baseUrl: unknown): string | undefined {
   } catch {
     return undefined
   }
-}
-
-function isOfficialDeepSeekOrigin(origin: string): boolean {
-  try {
-    return new URL(origin).hostname.toLowerCase() === 'api.deepseek.com'
-  } catch {
-    return false
-  }
-}
-
-function isOfficialDeepSeekProvider(provider: string): boolean {
-  return provider === 'deepseek-official' || provider === 'deepseek'
 }
 
 function readAt(section: unknown, path: readonly string[]): unknown {
@@ -213,6 +199,30 @@ function hostLabel(origin: string): string {
 /* 路由清单与凭据解析                                                    */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 0.1.7 起 settings 服务用 describe() 投影各条目（= profile 条目 id，如 `llm-pi-ai`）的
+ * 实时值，不再有 get(ns)。拿不到就返回空表，调用方会给出 no-provider。
+ */
+function settingsValues(ctx: Context): Map<string, unknown> {
+  const out = new Map<string, unknown>()
+  const settings = ctx.get('settings') as {
+    describe?: (options?: { redactSecrets?: boolean }) => Array<{ ns?: unknown; value?: unknown }>
+  } | undefined
+  if (settings?.describe === undefined) return out
+  try {
+    for (const row of settings.describe()) {
+      if (row !== null && typeof row?.ns === 'string') out.set(row.ns, row.value)
+    }
+  } catch {
+    // settings 服务不可用：当作没有可读路由。
+  }
+  return out
+}
+
+/**
+ * 已配置且带地址的模型路由。本插件只服务 New API，所以官方 DeepSeek 之类没有 baseURL
+ * 的 provider 在这里就没有 origin —— 自然被跳过，不做任何特判。
+ */
 export function listRouteAccounts(ctx: Context): RouteAccount[] {
   const llm = ctx.get('llm') as { listConfigurableProviders?: () => Array<{
     provider: string
@@ -220,24 +230,21 @@ export function listRouteAccounts(ctx: Context): RouteAccount[] {
     settingsNs: string
     settingsPath?: string[]
   }> } | undefined
-  const settings = ctx.get('settings') as { get?: (ns: string) => unknown } | undefined
-  if (llm?.listConfigurableProviders === undefined || settings?.get === undefined) return []
+  if (llm?.listConfigurableProviders === undefined) return []
+  const values = settingsValues(ctx)
 
   const out: RouteAccount[] = []
   for (const entry of llm.listConfigurableProviders()) {
     let profile: unknown
     try {
-      profile = readAt(settings.get(entry.settingsNs), entry.settingsPath ?? [])
+      profile = readAt(values.get(entry.settingsNs), entry.settingsPath ?? [])
     } catch {
       profile = undefined
     }
     const typed = profile as { baseURL?: string; baseUrl?: string; apiKeyEnv?: string } | undefined
-    let origin = originOf(typed?.baseURL ?? typed?.baseUrl)
-    if (origin === undefined && isOfficialDeepSeekProvider(entry.provider)) origin = DEEPSEEK_ORIGIN
+    const origin = originOf(typed?.baseURL ?? typed?.baseUrl)
     if (origin === undefined) continue
-    const apiKeyEnv = typeof typed?.apiKeyEnv === 'string' && typed.apiKeyEnv !== ''
-      ? typed.apiKeyEnv
-      : isOfficialDeepSeekProvider(entry.provider) ? DEEPSEEK_KEY_ENV : undefined
+    const apiKeyEnv = typeof typed?.apiKeyEnv === 'string' && typed.apiKeyEnv !== '' ? typed.apiKeyEnv : undefined
     out.push({
       route: entry.provider,
       displayName: entry.displayName ?? entry.provider,
@@ -248,11 +255,27 @@ export function listRouteAccounts(ctx: Context): RouteAccount[] {
   return out
 }
 
-export function currentAccount(ctx: Context): RouteAccount | undefined {
-  const accounts = listRouteAccounts(ctx)
+/**
+ * 只留探出来是 New API 的路由（用户已拍板：非 New API 的供应商直接隐藏）。
+ * 探测按 origin 缓存，所以每次刷新只对没认过的站点发一次匿名 GET /api/status。
+ * 全被滤掉时把逐条原因带出去，免得界面只会说「没有供应商」。
+ */
+async function newApiAccounts(ctx: Context): Promise<{ accounts: RouteAccount[]; reasons: string[] }> {
+  const all = listRouteAccounts(ctx)
+  const marks = await Promise.all(all.map(account => fingerprintOrigin(account.origin)))
+  const accounts: RouteAccount[] = []
+  const reasons: string[] = []
+  all.forEach((account, index) => {
+    const mark = marks[index]
+    if (mark?.software === 'newapi') accounts.push(account)
+    else reasons.push(`${account.displayName}（${account.origin}）：${mark?.reason ?? '不是 New API 站点'}`)
+  })
+  return { accounts, reasons }
+}
+
+export function currentAccount(accounts: RouteAccount[], ctx: Context): RouteAccount | undefined {
   if (accounts.length === 0) return undefined
-  const settings = ctx.get('settings') as { get?: (ns: string) => unknown } | undefined
-  const defaults = settings?.get?.('agent-default-model') as { provider?: string; model?: string } | undefined
+  const defaults = settingsValues(ctx).get('agent-default-model') as { provider?: string; model?: string } | undefined
   const hit = defaults?.provider !== undefined
     ? accounts.find(account => account.route === defaults.provider)
     : undefined
@@ -286,9 +309,71 @@ export interface AccessConfigSource {
 
 let accessConfigSource: AccessConfigSource | undefined
 
-/** 由入口模块在启动时注入（settings.register 返回的 scope.get）。 */
+/** 由入口模块在启动时注入（Config 的 volatile 引用）。 */
 export function setAccessConfigSource(source: AccessConfigSource | undefined): void {
   accessConfigSource = source
+}
+
+/** 本插件在 profile patch 里的条目 id 兜底值（= cordis.patch.yml 里插入的 id）。 */
+const DEFAULT_ENTRY_ID = 'loostone-newapi-wallet'
+
+/**
+ * 本插件自己的 profile 条目 id。官方写法见 `@deepseek-ai/dsh-llm-pi-ai`：
+ * `ctx.fiber.entry?.options.id ?? NS` —— 用户换了插入 id 也不会写错条目。
+ */
+function entryIdOf(ctx: Context): string {
+  const fiber = (ctx as Context & { fiber?: { entry?: { options?: { id?: unknown } } } }).fiber
+  const id = fiber?.entry?.options?.id
+  return typeof id === 'string' && id !== '' ? id : DEFAULT_ENTRY_ID
+}
+
+export interface AccessPatch {
+  /** 全局默认令牌；'' 表示清除。 */
+  accessToken?: string
+  /** 按路由覆盖；值 '' 表示删掉该路由的覆盖。 */
+  routeAccessTokens?: Record<string, string>
+}
+
+/**
+ * 写令牌的官方入口：`settings.update(本条目 id, patch)`。
+ * 服务端把 volatile 表单写进 profile 的 cordis.patch.yml，并让运行中的 volatile 引用
+ * 即时生效 —— 保存后无需重启，下一次 /api/newapi-wallet 读到的就是新令牌。
+ * 按路由覆盖要自己先合并成完整 map（浏览器拿不到其它路由的令牌，绝不下发）。
+ */
+export async function updateAccessConfig(ctx: Context, patch: AccessPatch): Promise<WalletError | undefined> {
+  const settings = ctx.get('settings') as {
+    update?: (ns: string, value: Record<string, unknown>) => Promise<unknown>
+  } | undefined
+  if (settings?.update === undefined) {
+    return { ok: false, error: 'no-settings', detail: 'settings 服务不可用，无法保存令牌' }
+  }
+  const current = accessConfigSource?.get() ?? {}
+  const next: Record<string, unknown> = {}
+  if (patch.accessToken !== undefined) next.accessToken = patch.accessToken
+  if (patch.routeAccessTokens !== undefined) {
+    const merged: Record<string, string> = { ...(current.routeAccessTokens ?? {}) }
+    for (const [route, token] of Object.entries(patch.routeAccessTokens)) {
+      const key = route.trim()
+      if (key === '') continue
+      // 删掉大小写不匹配的同名覆盖，避免残留两把令牌。
+      for (const existing of Object.keys(merged)) {
+        if (existing.trim().toLowerCase() === key.toLowerCase()) delete merged[existing]
+      }
+      if (token !== '') merged[key] = token
+    }
+    next.routeAccessTokens = merged
+  }
+  if (Object.keys(next).length === 0) return undefined
+  try {
+    await settings.update(entryIdOf(ctx), next)
+    return undefined
+  } catch (error) {
+    return {
+      ok: false,
+      error: 'settings-write-failed',
+      detail: error instanceof Error ? error.message : String(error),
+    }
+  }
 }
 
 function normalizedRouteKey(route: string): string {
@@ -297,8 +382,8 @@ function normalizedRouteKey(route: string): string {
 
 /**
  * 解析某条路由的查账凭据（New API 访问令牌）。
- * 顺序：routeAccessTokens[route] → accessToken。**不含** sk- 模型密钥。
- * sk- 密钥只允许作为指纹探针的 Authorization（见 index.ts 的 probeAuthorization）。
+ * 顺序：routeAccessTokens[route] → accessToken。**不含** sk- 模型密钥 ——
+ * sk- 密钥是 LLM 路由的凭据，永远不参与查账。
  */
 function accessKeyForRoute(route: string): string | undefined {
   const config = accessConfigSource?.get()
@@ -315,18 +400,11 @@ function accessKeyForRoute(route: string): string | undefined {
   return undefined
 }
 
-/** 仅供指纹探针用：访问令牌优先，缺省时用该路由的 sk- 密钥。绝不用于查账数据请求。 */
-export function probeAuthorizationForRoute(ctx: Context, route: string): Promise<string | undefined> {
-  const token = accessKeyForRoute(route)
-  if (token !== undefined) return Promise.resolve(token)
-  const account = listRouteAccounts(ctx).find(entry => entry.route === route)
-  return resolveApiKey(ctx, account?.apiKeyEnv)
-}
-
 export async function listAccounts(ctx: Context): Promise<AccountListItem[]> {
-  const current = currentAccount(ctx)
+  const { accounts: detected } = await newApiAccounts(ctx)
+  const current = currentAccount(detected, ctx)
   const out: AccountListItem[] = []
-  for (const account of listRouteAccounts(ctx)) {
+  for (const account of detected) {
     const apiKey = await resolveApiKey(ctx, account.apiKeyEnv)
     const hasCredential = apiKey !== undefined && apiKey !== ''
     const hasAccessKey = accessKeyForRoute(account.route) !== undefined
@@ -345,10 +423,15 @@ export async function listAccounts(ctx: Context): Promise<AccountListItem[]> {
   return out
 }
 
-function accountForRoute(ctx: Context, route: string | undefined): RouteAccount | WalletError {
-  const accounts = listRouteAccounts(ctx)
-  if (accounts.length === 0) return { ok: false, error: 'no-provider' }
-  const current = currentAccount(ctx)
+async function accountForRoute(ctx: Context, route: string | undefined): Promise<RouteAccount | WalletError> {
+  const { accounts, reasons } = await newApiAccounts(ctx)
+  if (accounts.length === 0) {
+    // 有模型路由，但没有一条像 New API：说清是哪几条、为什么，别报成「没配供应商」。
+    return reasons.length === 0
+      ? { ok: false, error: 'no-provider' }
+      : { ok: false, error: 'no-newapi', detail: reasons.join('；') }
+  }
+  const current = currentAccount(accounts, ctx)
   if (route === undefined || route === '') {
     return current ?? { ok: false, error: 'no-provider' }
   }
@@ -819,7 +902,8 @@ async function readNewApi(account: RouteAccount, accessKey: string): Promise<Wal
 }
 
 export async function fetchWallet(ctx: Context, route?: string): Promise<WalletSnapshot | WalletError> {
-  const account = accountForRoute(ctx, route)
+  // accountForRoute 已经按 New API 指纹筛过（结果按 origin 缓存），所以这里不再重复探测。
+  const account = await accountForRoute(ctx, route)
   if ('ok' in account && account.ok === false) return account
 
   // 查账凭据：只认 New API 访问令牌。sk- 模型密钥绝不发往用户级路由。
@@ -829,16 +913,6 @@ export async function fetchWallet(ctx: Context, route?: string): Promise<WalletS
   }
 
   try {
-    if (isOfficialDeepSeekOrigin(account.origin)) {
-      return { ok: false, error: 'unsupported-official', detail: account.origin }
-    }
-    const finger = await fingerprintOrigin(account.origin)
-    if (finger.software === 'unknown') {
-      return { ok: false, error: 'unknown-software', detail: finger.reason ?? account.origin }
-    }
-    if (finger.software === 'sub2api') {
-      return { ok: false, error: 'scheme-unsupported', detail: 'sub2api 站点不在本 fork 支持范围' }
-    }
     return await readNewApi(account, accessKey)
   } catch (error) {
     const name = error instanceof Error && error.name === 'AbortError' ? 'timeout' : 'unreachable'
