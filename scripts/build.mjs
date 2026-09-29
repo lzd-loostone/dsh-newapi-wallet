@@ -3,7 +3,9 @@
  *
  * 用法：node scripts/build.mjs
  * 依赖：.build-deps/node_modules 下的 esbuild（`npm i --no-save --prefix .build-deps esbuild`）
- *      以及 node_modules/@deepseek-ai/{schemastery,cosmokit}（构建期需要，会被内联进 lib/index.js）
+ *      以及 node_modules/@deepseek-ai/{schemastery,cosmokit}（构建期需要，会被内联进 lib/index.js）。
+ *      两者版本必须跟运行时 dsh 自带的一致（0.2.0-rc.1 = schemastery 3.18.4 + cosmokit 1.8.5）
+ *      ——Config 用的 .volatile() 原语是 3.18.4 才有的，旧版内联进来会直接 TypeError。
  *
  * 与上游 build.sh 的两处关键差异（都是必须的）：
  *  1. 不再用 --external:@deepseek-ai/*，只把纯类型的 cordis 与宿主提供的客户端接缝标为 external，
