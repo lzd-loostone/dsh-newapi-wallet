@@ -64,16 +64,22 @@ export interface UsageAmounts {
   total?: Money
 }
 
-/** 今日按模型拆分的一行（来自 /api/data/self 的聚合行）。 */
-export interface TodayModelRow {
-  model: string
-  /** 该模型今日实扣 quota 点数。 */
+/**
+ * 左侧「今日按模型 / 今日按令牌」的一行。两个列表同形状，只是分组键不同。
+ *
+ * 口径恒为**全天**：左侧永远是当日画像，不随右侧筛选收窄——否则一点某行，
+ * 列表自己就塌成 1 行，用户再也点不回别的分组。
+ */
+export interface TodayGroupRow {
+  /** 分组名：模型名，或令牌名。 */
+  name: string
+  /** 该组今日实扣 quota 点数。 */
   quota: number
-  /** 该模型今日调用次数。 */
+  /** 该组今日调用次数。 */
   calls: number
-  /** 该模型今日 token 消耗（token_used 合计）。 */
+  /** 该组今日 token 消耗（四桶合计）。 */
   tokens?: number
-  /** 该模型今日实扣金额（账本 quota 直接换算，非估算）。 */
+  /** 该组今日实扣金额（账本 quota 直接换算，非估算）。 */
   amount?: Money
 }
 
@@ -90,6 +96,8 @@ export interface CallRecord {
   completionTokens?: number
   /** 命中缓存的 prompt token 数（从 other JSON 字符串里解析）。 */
   cacheTokens?: number
+  /** 写进缓存的 prompt token 数（与命中读取是两回事）。 */
+  cacheWriteTokens?: number
   requestId?: string
   group?: string
   tokenName?: string
@@ -124,11 +132,17 @@ export interface WalletSnapshot {
   dailyHistory?: DailyPoint[]
   /** 今日实际扫描到的账单行数（token/金额拆分的口径）。 */
   todayLogRows?: number
-  /** true = 今日行数超过扫描上限，token 与金额拆分只覆盖最近的部分。 */
-  todayLogsPartial?: boolean
+  /** true = 今日行数超过扫描上限，只统计了较新的一部分（页面明确标注，不静默失真）。 */
+  todayLogsTruncated?: boolean
+  /** 今日账本总行数（服务端当日总行数），截断时可对比出漏了多少。 */
+  todayLedgerRows?: number
+  /** 当前生效的筛选。缺省 = 未筛选。 */
+  filter?: { model?: string; token?: string }
   totalTokens?: TokenBuckets
-  /** 今日按模型拆分。 */
-  todayModels?: TodayModelRow[]
+  /** 今日按模型（**全天口径**，不随 filter 收窄）。 */
+  todayModels?: TodayGroupRow[]
+  /** 今日按令牌（**全天口径**，不随 filter 收窄）。 */
+  todayTokenRows?: TodayGroupRow[]
   /** 最近逐条消费明细（最新在前）。 */
   recentCalls?: CallRecord[]
   rate?: { rpm?: number; tpm?: number }

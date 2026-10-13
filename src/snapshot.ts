@@ -22,12 +22,14 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { fingerprintOrigin } from './fingerprint.ts'
+import { readLedger, aggregate } from './ledger.ts'
+import type { LedgerFilter, LedgerTotals } from './ledger.ts'
 import type {
   AccountListItem,
   CallRecord,
   DailyPoint,
   Money,
-  TodayModelRow,
+  TodayGroupRow,
   TokenBuckets,
   UsageAmounts,
   WalletBundle,
@@ -37,9 +39,6 @@ import type {
 
 const TIMEOUT_MS = 15_000
 const LOG_PAGE_SIZE = 100
-const RECENT_MAX = 30
-/** 今日账本分页聚合上限（页 × 每页条数）。超出只累计最近的部分，并标记 partial。 */
-const LOG_MAX_PAGES = 10
 /** 热力图天数：4 行 × 7 列。 */
 const HEAT_DAYS = 28
 /** 缺失日逐日 stat 补探上限（每次 ~80ms）；「今天」豁免预算。超出预算的日期显示「无数据」。 */
@@ -301,12 +300,9 @@ async function resolveApiKey(ctx: Context, reference: string | undefined): Promi
   }
 }
 
-/**
- * New API 访问令牌设置（settings 服务里 `newapi-wallet` 名字的值）。
- * 从入口模块注入，避免 snapshot → settings 模块环。
- */
+/** 访问令牌配置（从入口模块注入，避免 snapshot → index 模块环）。0.2.2 起全站唯一。 */
 export interface AccessConfigSource {
-  get(): { accessToken?: string; routeAccessTokens?: Record<string, string>; refreshMs?: number } | undefined
+  get(): { accessToken?: string; refreshMs?: number } | undefined
 }
 
 let accessConfigSource: AccessConfigSource | undefined
@@ -316,90 +312,13 @@ export function setAccessConfigSource(source: AccessConfigSource | undefined): v
   accessConfigSource = source
 }
 
-/** 本插件在 profile patch 里的条目 id 兜底值（= cordis.patch.yml 里插入的 id）。 */
-const DEFAULT_ENTRY_ID = 'loostone-newapi-wallet'
-
 /**
- * 本插件自己的 profile 条目 id。官方写法见 `@deepseek-ai/dsh-llm-pi-ai`：
- * `ctx.fiber.entry?.options.id ?? NS` —— 用户换了插入 id 也不会写错条目。
+ * 查账凭据（New API 访问令牌）。只认 accessToken 一个来源 ——
+ * sk- 模型密钥是 LLM 路由的凭据，永远不参与查账。
  */
-function entryIdOf(ctx: Context): string {
-  const fiber = (ctx as Context & { fiber?: { entry?: { options?: { id?: unknown } } } }).fiber
-  const id = fiber?.entry?.options?.id
-  return typeof id === 'string' && id !== '' ? id : DEFAULT_ENTRY_ID
-}
-
-export interface AccessPatch {
-  /** 全局默认令牌；'' 表示清除。 */
-  accessToken?: string
-  /** 按路由覆盖；值 '' 表示删掉该路由的覆盖。 */
-  routeAccessTokens?: Record<string, string>
-}
-
-/**
- * 写令牌的官方入口：`settings.update(本条目 id, patch)`。
- * 服务端把 volatile 表单写进 profile 的 cordis.patch.yml，并让运行中的 volatile 引用
- * 即时生效 —— 保存后无需重启，下一次 /api/newapi-wallet 读到的就是新令牌。
- * 按路由覆盖要自己先合并成完整 map（浏览器拿不到其它路由的令牌，绝不下发）。
- */
-export async function updateAccessConfig(ctx: Context, patch: AccessPatch): Promise<WalletError | undefined> {
-  const settings = ctx.get('settings') as {
-    update?: (ns: string, value: Record<string, unknown>) => Promise<unknown>
-  } | undefined
-  if (settings?.update === undefined) {
-    return { ok: false, error: 'no-settings', detail: 'settings 服务不可用，无法保存令牌' }
-  }
-  const current = accessConfigSource?.get() ?? {}
-  const next: Record<string, unknown> = {}
-  if (patch.accessToken !== undefined) next.accessToken = patch.accessToken
-  if (patch.routeAccessTokens !== undefined) {
-    const merged: Record<string, string> = { ...(current.routeAccessTokens ?? {}) }
-    for (const [route, token] of Object.entries(patch.routeAccessTokens)) {
-      const key = route.trim()
-      if (key === '') continue
-      // 删掉大小写不匹配的同名覆盖，避免残留两把令牌。
-      for (const existing of Object.keys(merged)) {
-        if (existing.trim().toLowerCase() === key.toLowerCase()) delete merged[existing]
-      }
-      if (token !== '') merged[key] = token
-    }
-    next.routeAccessTokens = merged
-  }
-  if (Object.keys(next).length === 0) return undefined
-  try {
-    await settings.update(entryIdOf(ctx), next)
-    return undefined
-  } catch (error) {
-    return {
-      ok: false,
-      error: 'settings-write-failed',
-      detail: error instanceof Error ? error.message : String(error),
-    }
-  }
-}
-
-function normalizedRouteKey(route: string): string {
-  return route.trim().toLowerCase()
-}
-
-/**
- * 解析某条路由的查账凭据（New API 访问令牌）。
- * 顺序：routeAccessTokens[route] → accessToken。**不含** sk- 模型密钥 ——
- * sk- 密钥是 LLM 路由的凭据，永远不参与查账。
- */
-function accessKeyForRoute(route: string): string | undefined {
-  const config = accessConfigSource?.get()
-  const perRoute = config?.routeAccessTokens
-  if (perRoute !== undefined && perRoute !== null && typeof perRoute === 'object') {
-    for (const [key, value] of Object.entries(perRoute)) {
-      if (typeof value === 'string' && value.trim() !== '' && normalizedRouteKey(key) === normalizedRouteKey(route)) {
-        return value.trim()
-      }
-    }
-  }
-  const globalToken = config?.accessToken
-  if (typeof globalToken === 'string' && globalToken.trim() !== '') return globalToken.trim()
-  return undefined
+function accessKey(): string | undefined {
+  const token = accessConfigSource?.get()?.accessToken
+  return typeof token === 'string' && token.trim() !== '' ? token.trim() : undefined
 }
 
 export async function listAccounts(ctx: Context): Promise<AccountListItem[]> {
@@ -409,7 +328,7 @@ export async function listAccounts(ctx: Context): Promise<AccountListItem[]> {
   for (const account of detected) {
     const apiKey = await resolveApiKey(ctx, account.apiKeyEnv)
     const hasCredential = apiKey !== undefined && apiKey !== ''
-    const hasAccessKey = accessKeyForRoute(account.route) !== undefined
+    const hasAccessKey = accessKey() !== undefined
     out.push({
       route: account.route,
       displayName: account.displayName,
@@ -452,7 +371,7 @@ interface TodayOutcome {
   money?: Money
   requests?: number
   tokens?: TokenBuckets
-  models?: TodayModelRow[]
+  models?: TodayGroupRow[]
   rate?: { rpm?: number; tpm?: number }
   reason?: string
 }
@@ -502,7 +421,7 @@ async function fetchToday(
     })
     if (isNewApiOk(aggregate.status, aggregate.body)) {
       const rows = Array.isArray(aggregate.body.data) ? aggregate.body.data : []
-      const byModel = new Map<string, TodayModelRow>()
+      const byModel = new Map<string, TodayGroupRow>()
       let quota = 0
       let requests = 0
       let tokensTotal: number | undefined
@@ -521,7 +440,7 @@ async function fetchToday(
           : '未知模型'
         const existing = byModel.get(model)
         if (existing === undefined) {
-          byModel.set(model, { model, quota: rowQuota, calls: rowCalls, ...(rowTokens !== undefined ? { tokens: rowTokens } : {}) })
+          byModel.set(model, { name: model, quota: rowQuota, calls: rowCalls, ...(rowTokens !== undefined ? { tokens: rowTokens } : {}) })
         } else {
           existing.quota += rowQuota
           existing.calls += rowCalls
@@ -624,276 +543,16 @@ async function fetchDailyHistory(
   }
 }
 
-/** 表达式计费解出的相对单价（美元 / 百万 token）。只需相对值：最终按真实 quota 回缩。 */
-interface TokenPrice {
-  /** 未缓存输入。 */
-  p: number
-  /** 输出。 */
-  c: number
-  /** 缓存命中读取。 */
-  cr: number
-  /** 缓存写入。 */
-  cc: number
-}
-
-/**
- * 解 other.expr_b64（base64 的计费表达式），取四个变量的单价系数。
- * 实测核对当日 580 行账本：把 p 当作 prompt − cacheRead − cacheWrite 后，
- * 表达式算出的值 × (quota_per_unit / 1e6) 与账本 quota 误差 ≤ 0.5（纯取整）。
- * 解不出任何系数（表达式换了形态）时返回 undefined，调用方退回旧版比例拆分。
- */
-function parsePrice(exprB64: unknown): TokenPrice | undefined {
-  if (typeof exprB64 !== 'string' || exprB64 === '') return undefined
-  let expression: string
-  try {
-    expression = Buffer.from(exprB64, 'base64').toString('utf8')
-  } catch {
-    return undefined
-  }
-  const price: TokenPrice = { p: 0, c: 0, cr: 0, cc: 0 }
-  let hits = 0
-  for (const match of expression.matchAll(/\b(cc|cr|p|c)\s*\*\s*([0-9.]+)/g)) {
-    const value = Number(match[2])
-    if (!Number.isFinite(value) || value < 0) continue
-    price[match[1] as keyof TokenPrice] = value
-    hits += 1
-  }
-  return hits === 0 ? undefined : price
-}
-
-/**
- * /api/log/self 的 `other` 字段是 JSON 字符串，自带这笔的 token 分桶与计费依据。
- * cache_tokens 是命中读取，cache_creation_tokens 是写入缓存，两者互不包含。
- */
-function parseOther(value: unknown): {
-  cacheReadTokens?: number
-  cacheWriteTokens?: number
-  price?: TokenPrice
-  modelRatio?: number
-  completionRatio?: number
-  cacheRatio?: number
-  groupRatio?: number
-} {
-  if (typeof value !== 'string' || value.trim() === '') return {}
-  try {
-    const parsed = JSON.parse(value) as Record<string, unknown>
-    const cacheReadTokens = num(parsed.cache_tokens)
-    // 同一笔在不同渠道下这两个键名二选一出现，实测共存时取值恒等。
-    const cacheWriteTokens = num(parsed.cache_creation_tokens) ?? num(parsed.cache_write_tokens)
-    const price = parsePrice(parsed.expr_b64)
-    const modelRatio = num(parsed.model_ratio)
-    const completionRatio = num(parsed.completion_ratio)
-    const cacheRatio = num(parsed.cache_ratio)
-    const groupRatio = num(parsed.group_ratio) ?? num(parsed.user_group_ratio)
-    return {
-      ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
-      ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
-      ...(price !== undefined ? { price } : {}),
-      ...(modelRatio !== undefined ? { modelRatio } : {}),
-      ...(completionRatio !== undefined ? { completionRatio } : {}),
-      ...(cacheRatio !== undefined ? { cacheRatio } : {}),
-      ...(groupRatio !== undefined ? { groupRatio } : {}),
-    }
-  } catch {
-    return {}
-  }
-}
-
-/** 全天账本聚合结果。 */
-interface LedgerOutcome {
-  ok: boolean
-  /** 展示用的最近 RECENT_MAX 条明细（最新在前）。 */
-  records: CallRecord[]
-  /** 今日扫描到的账本行数。 */
-  rows: number
-  /** 真正未命中的输入 token（prompt − 缓存命中 − 缓存写入）全天合计。 */
-  inputTokens: number
-  outputTokens: number
-  /** 命中缓存读取（other.cache_tokens）。 */
-  cacheTokens: number
-  /** 写入缓存（other.cache_creation_tokens），与命中读取分开计。 */
-  cacheWriteTokens: number
-  /** 金额分量（quota 点数）：回缩后四桶之和恒等于 total。 */
-  amountQuota: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }
-  /** 按模型聚合（与 token 桶同源，都来自账本行，所以合计恒等于 amountQuota.total）。 */
-  models: Map<string, { quota: number; calls: number; tokens: number }>
-  /** 服务端上报的今日总行数（data.total）。 */
-  serverTotal?: number
-  /** 今日行数超过分页上限，聚合只覆盖最近的部分。 */
-  partial: boolean
-}
-
-/**
- * 分页拉取今日消费账本（type=2）并聚合：展示明细取最近 30 条；
- * token 桶与金额拆分对全部拉到的行求和（旧版只对最近 30 条求和，是缺陷，已修）。
- * 金额拆分对每行按账本自带比例算分量后、再按该行真实 quota 回缩，
- * 所以各分量之和与本行 quota、与全天账本合计都严格一致。
- *
- * 分页坑（实测）：本网关的翻页参数是 p，`page` 会被无视并反复返回第一页
- * （曾导致聚合膨胀 10 倍）。除改用 p 外，再按行 id 去重、整页重复即停兜底。
- */
-async function fetchTodayLedger(
-  origin: string,
-  accessKey: string,
-  units: QuotaUnits,
-): Promise<LedgerOutcome> {
-  const from = Math.floor(localDayStartMs() / 1000)
-  const to = Math.floor(Date.now() / 1000)
-  const out: LedgerOutcome = {
-    ok: false,
-    records: [],
-    rows: 0,
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheTokens: 0,
-    cacheWriteTokens: 0,
-    amountQuota: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    models: new Map(),
-    partial: false,
-  }
-  let page = 1
-  let shortPageSeen = false
-  let fresh = 0
-  const seenRowIds = new Set<number>()
-  while (page <= LOG_MAX_PAGES) {
-    let status: number
-    let body: Record<string, unknown>
-    try {
-      const result = await getJson(origin, '/api/log/self', accessKey, {
-        type: 2,
-        p: page,
-        page_size: LOG_PAGE_SIZE,
-        start_timestamp: from,
-        end_timestamp: to,
-      })
-      status = result.status
-      body = result.body
-    } catch {
-      break
-    }
-    if (!isNewApiOk(status, body)) break
-    out.ok = true
-    const payload = body.data
-    const rawItems = payload !== null && typeof payload === 'object' && Array.isArray((payload as { items?: unknown }).items)
-      ? (payload as { items: unknown[] }).items
-      : Array.isArray(payload)
-        ? payload
-        : []
-    out.rows += rawItems.length
-    if (payload !== null && typeof payload === 'object') {
-      const totalFromServer = num((payload as { total?: unknown }).total)
-      if (totalFromServer !== undefined) out.serverTotal = totalFromServer
-    }
-    fresh = 0
-    for (const item of rawItems) {
-      if (item === null || typeof item !== 'object') continue
-      const record = item as Record<string, unknown>
-      // 行 id 去重：若服务端某页与已扫内容重复（分页失效的病征），只算一次。
-      const rowId = num(record.id)
-      if (rowId !== undefined) {
-        if (seenRowIds.has(rowId)) continue
-        seenRowIds.add(rowId)
-      }
-      fresh += 1
-      const createdAtMs = epochMs(num(record.created_at))
-      if (createdAtMs === undefined) continue
-      const quota = num(record.quota)
-      const promptTokens = num(record.prompt_tokens)
-      const completionTokens = num(record.completion_tokens)
-      const other = parseOther(record.other)
-      const model = typeof record.model_name === 'string' && record.model_name !== '' ? record.model_name : undefined
-      const requestId = typeof record.request_id === 'string' && record.request_id !== '' ? record.request_id : undefined
-      const group = typeof record.group === 'string' && record.group !== '' ? record.group : undefined
-      const tokenName = typeof record.token_name === 'string' && record.token_name !== '' ? record.token_name : undefined
-      if (out.records.length < RECENT_MAX) {
-        out.records.push({
-          createdAt: createdAtMs,
-          ...model !== undefined ? { model } : {},
-          ...quota !== undefined ? { quota } : {},
-          ...quota !== undefined ? { amount: quotaToMoney(quota, units) } : {},
-          ...promptTokens !== undefined ? { promptTokens } : {},
-          ...completionTokens !== undefined ? { completionTokens } : {},
-          ...other.cacheReadTokens !== undefined ? { cacheTokens: other.cacheReadTokens } : {},
-          ...requestId !== undefined ? { requestId } : {},
-          ...group !== undefined ? { group } : {},
-          ...tokenName !== undefined ? { tokenName } : {},
-        })
-      }
-      // 全天聚合：token 四桶 + 金额拆分 + 按模型。
-      // token 口径：prompt 里可能同时含命中读取与写入缓存，两者都要先扣掉，
-      // 剩下的才是真正未命中的输入——否则 cache_creation 会被重复算进「输入」。
-      const billedQuota = quota ?? 0
-      const prompt = promptTokens ?? 0
-      const cacheRead = Math.min(other.cacheReadTokens ?? 0, prompt)
-      const cacheWrite = Math.min(other.cacheWriteTokens ?? 0, prompt - cacheRead)
-      const uncached = Math.max(prompt - cacheRead - cacheWrite, 0)
-      const completion = completionTokens ?? 0
-      out.inputTokens += uncached
-      out.outputTokens += completion
-      out.cacheTokens += cacheRead
-      out.cacheWriteTokens += cacheWrite
-      out.amountQuota.total += billedQuota
-      if (model !== undefined) {
-        const hit = out.models.get(model)
-        if (hit === undefined) {
-          out.models.set(model, { quota: billedQuota, calls: 1, tokens: prompt + completion })
-        } else {
-          hit.quota += billedQuota
-          hit.calls += 1
-          hit.tokens += prompt + completion
-        }
-      }
-      // 分量权重：优先用表达式计费解出的真实单价；旧式 ratio 计费（未见表达式）时退回旧口径。
-      const price = other.price
-      const gr = other.groupRatio ?? 1
-      const wIn = price !== undefined ? uncached * price.p : uncached * (other.modelRatio ?? 1) * gr
-      const wOut = price !== undefined ? completion * price.c : completion * (other.completionRatio ?? 1) * gr
-      const wRead = price !== undefined ? cacheRead * price.cr : cacheRead * (other.cacheRatio ?? 0) * (other.modelRatio ?? 1) * gr
-      const wWrite = price !== undefined ? cacheWrite * price.cc : 0
-      const sum = wIn + wOut + wRead + wWrite
-      let qIn: number
-      let qOut: number
-      let qRead: number
-      let qWrite: number
-      if (billedQuota > 0 && sum > 0) {
-        const k = billedQuota / sum
-        qIn = wIn * k
-        qOut = wOut * k
-        qRead = wRead * k
-        qWrite = wWrite * k
-      } else if (billedQuota > 0) {
-        // 权重全为 0（既无表达式也无旧比例）：整笔计入输入，不丢合计。
-        qIn = billedQuota
-        qOut = 0
-        qRead = 0
-        qWrite = 0
-      } else {
-        qIn = 0
-        qOut = 0
-        qRead = 0
-        qWrite = 0
-      }
-      out.amountQuota.input += qIn
-      out.amountQuota.output += qOut
-      out.amountQuota.cacheRead += qRead
-      out.amountQuota.cacheWrite += qWrite
-    }
-    if (rawItems.length < LOG_PAGE_SIZE || fresh === 0) {
-      // 最后一页（或整页重复的病态）：停止。
-      shortPageSeen = true
-      break
-    }
-    page += 1
-  }
-  out.partial = out.ok && (out.serverTotal === undefined ? !shortPageSeen : out.rows < out.serverTotal)
-  return out
-}
 
 /* ------------------------------------------------------------------ */
 /* 快照主体                                                             */
 /* ------------------------------------------------------------------ */
 
-async function readNewApi(account: RouteAccount, accessKey: string): Promise<WalletSnapshot | WalletError> {
+async function readNewApi(
+  account: RouteAccount,
+  accessKey: string,
+  filter: LedgerFilter = {},
+): Promise<WalletSnapshot | WalletError> {
   const units = await readUnits(account.origin)
 
   // 剩余 / 累计：/api/user/self（账户级）。
@@ -914,11 +573,28 @@ async function readNewApi(account: RouteAccount, accessKey: string): Promise<Wal
   const today = await fetchToday(account.origin, accessKey, units)
   const todayOk = today.reason === undefined && today.money !== undefined
 
-  // 逐条明细 + 全天聚合（展示取最近 30 条，token 桶与金额拆分对全部拉到的行求和）。
-  const ledger = await fetchTodayLedger(account.origin, accessKey, units)
-  const recentCalls = ledger.ok ? ledger.records : undefined
+  // 全天账单：本地缓存 + 增量追加 + 本地筛选（详见 ledger.ts）。
+  // 筛选只作用于右侧「今日用量」与「最近调用」；头部实扣与热力图恒为全天口径（用户拍板）。
+  const ledger = await readLedger(account.origin, accessKey, filter)
+  // 逐条明细要带金额：客户端对 undefined 一律渲染「—」，整个金额列就空白了。
+  // 账本缓存只存 quota 点数（单位换算依赖站点 /api/status，属于本层），所以在这里换成 Money。
+  const recentCalls: CallRecord[] | undefined = ledger !== undefined && ledger.calls.length > 0
+    ? ledger.calls.map((call) => ({
+        createdAt: call.createdAt,
+        ...call.model !== undefined ? { model: call.model } : {},
+        quota: round6(call.quota),
+        amount: quotaToMoney(round6(call.quota), units),
+        promptTokens: call.promptTokens,
+        completionTokens: call.completionTokens,
+        cacheTokens: call.cacheTokens,
+        cacheWriteTokens: call.cacheWriteTokens,
+        requestId: call.requestId,
+        ...call.group !== undefined ? { group: call.group } : {},
+        ...call.tokenName !== undefined ? { tokenName: call.tokenName } : {},
+      }))
+    : undefined
 
-  // 近 4 周逐日消费（热力图）；失败/缺字段只是不渲染该区块。
+  // 近 4 周逐日消费（热力图）。实测 /api/data/self 忽略筛选参数，所以它永远是全天口径。
   const dailyHistory = await fetchDailyHistory(account.origin, accessKey, units)
 
   // 今日 token 桶：四桶与合计一律来自全天账本行，彼此同源 —— 四桶之和恒等于合计，
@@ -926,16 +602,26 @@ async function readNewApi(account: RouteAccount, accessKey: string): Promise<Wal
   // 账本拿不到时才退回 data/self 的聚合值，并在页面上按缺字段呈现，不假装精确。
   let todayTokens: TokenBuckets | undefined
   let todayAmounts: UsageAmounts | undefined
-  let todayModels = today.models
+  // 左侧两个列表的兜底：账本拿不到时才退回 /api/data/self 的模型聚合（同样全天口径）。
+  let todayModels: TodayGroupRow[] | undefined = today.models
+  let todayTokenRows: TodayGroupRow[] | undefined
   {
-    const hasLedger = ledger.ok && ledger.rows > 0
-    const requests = today.requests
-    const inputTokens = hasLedger ? ledger.inputTokens : undefined
-    const outputTokens = hasLedger ? ledger.outputTokens : undefined
-    const cacheReadTokens = hasLedger ? ledger.cacheTokens : undefined
-    const cacheWriteTokens = hasLedger ? ledger.cacheWriteTokens : undefined
-    const total = hasLedger
-      ? ledger.inputTokens + ledger.outputTokens + ledger.cacheTokens + ledger.cacheWriteTokens
+    // 「账本取到手了」与「筛选后还剩行」是两件事，必须分开判。
+    // 旧写法拿 ledger.rows > 0 当「账本可用」，于是「模型 × 令牌」的空交集
+    // （一条调用都没有）被误判成「账本不可用」：左列两个列表整块消失、
+    // todayAmounts 一起丢，而「合计 token」退回全天 /api/data/self 的值——
+    // 同一张表里「请求 0」与「合计 token 7961 万」并列，两个口径被缝在一起。
+    // 空交集是**合法结果**，就该如实地显示成全 0。
+    const led = ledger
+    // 「请求」次数必须与四桶同源：筛选后若继续用未筛选的 data/self 聚合值，
+    // 会出现「请求 1931 次」但四桶只有 19 行数据的自相矛盾。
+    const requests = led !== undefined ? led.rows : today.requests
+    const inputTokens = led?.inputTokens
+    const outputTokens = led?.outputTokens
+    const cacheReadTokens = led?.cacheReadTokens
+    const cacheWriteTokens = led?.cacheWriteTokens
+    const total = led !== undefined
+      ? led.inputTokens + led.outputTokens + led.cacheReadTokens + led.cacheWriteTokens
       : today.tokens?.totalTokens
     const hasAny = inputTokens !== undefined || outputTokens !== undefined
       || cacheReadTokens !== undefined || cacheWriteTokens !== undefined
@@ -950,27 +636,29 @@ async function readNewApi(account: RouteAccount, accessKey: string): Promise<Wal
         ...(total !== undefined ? { totalTokens: total } : {}),
       }
     }
-    if (hasLedger) {
+    if (led !== undefined) {
+      // 金额四桶随筛选收窄；空交集时就是四个 0，仍要下发（否则右列金额列整片空白）。
       todayAmounts = {
-        input: quotaToMoney(round6(ledger.amountQuota.input), units),
-        output: quotaToMoney(round6(ledger.amountQuota.output), units),
-        cacheRead: quotaToMoney(round6(ledger.amountQuota.cacheRead), units),
-        cacheWrite: quotaToMoney(round6(ledger.amountQuota.cacheWrite), units),
-        total: quotaToMoney(round6(ledger.amountQuota.total), units),
+        input: quotaToMoney(round6(led.amountQuota.input), units),
+        output: quotaToMoney(round6(led.amountQuota.output), units),
+        cacheRead: quotaToMoney(round6(led.amountQuota.cacheRead), units),
+        cacheWrite: quotaToMoney(round6(led.amountQuota.cacheWrite), units),
+        total: quotaToMoney(round6(led.amountQuota.total), units),
       }
-      // 按模型拆分改用账本行聚合：与上方四桶、与账本合计同源，
-      // quota 合计恒等于 todayAmounts.total（旧版取 data/self，当前小时会少一截）。
-      if (ledger.models.size > 0) {
-        todayModels = [...ledger.models.entries()]
-          .map(([model, row]) => ({
-            model,
+      // 两个列表都走**全天**聚合（led.models / tokensByName 与 filter 无关），
+      // 与四桶同源所以 quota 合计恒等于 todayAmounts.total —— 但它们不随筛选收窄。
+      const groupRows = (map: Map<string, { quota: number; calls: number; tokens: number }>): TodayGroupRow[] =>
+        [...map.entries()]
+          .map(([name, row]) => ({
+            name,
             quota: round6(row.quota),
             calls: row.calls,
             tokens: row.tokens,
             amount: quotaToMoney(round6(row.quota), units),
           }))
           .sort((a, b) => b.quota - a.quota)
-      }
+      if (led.models.size > 0) todayModels = groupRows(led.models)
+      if (led.tokensByName.size > 0) todayTokenRows = groupRows(led.tokensByName)
     }
   }
 
@@ -993,9 +681,19 @@ async function readNewApi(account: RouteAccount, accessKey: string): Promise<Wal
     ...todayTokens !== undefined ? { todayTokens } : {},
     ...todayAmounts !== undefined ? { todayAmounts } : {},
     ...dailyHistory !== undefined ? { dailyHistory } : {},
-    ...ledger.ok && ledger.rows > 0 ? { todayLogRows: ledger.rows } : {},
-    ...ledger.ok && ledger.partial ? { todayLogsPartial: true } : {},
+    // 空交集时它就是 0：0 是**结果**，不是「缺字段」，必须下发，否则右列数字自相矛盾。
+    ...ledger !== undefined ? { todayLogRows: ledger.rows } : {},
+    ...ledger !== undefined && ledger.truncated ? { todayLogsTruncated: true } : {},
+    // 「今日 N 行」这里的 N 是**服务端**当日总行数，不是本地缓存行数——
+    // 截断日要用它和「已统计 M 行」对比出漏了多少，否则这行状态永远自说自话。
+    ...ledger !== undefined && (ledger.serverTotal ?? ledger.allRows) > 0
+      ? { todayLedgerRows: ledger.serverTotal ?? ledger.allRows }
+      : {},
+    ...filter.model !== undefined || filter.token !== undefined
+      ? { filter: { ...filter.model !== undefined ? { model: filter.model } : {}, ...filter.token !== undefined ? { token: filter.token } : {} } }
+      : {},
     ...todayModels !== undefined && todayModels.length > 0 ? { todayModels } : {},
+    ...todayTokenRows !== undefined && todayTokenRows.length > 0 ? { todayTokenRows } : {},
     ...recentCalls !== undefined && recentCalls.length > 0 ? { recentCalls } : {},
     ...today.rate !== undefined ? { rate: today.rate } : {},
     scheme: 'newapi',
@@ -1003,19 +701,23 @@ async function readNewApi(account: RouteAccount, accessKey: string): Promise<Wal
   }
 }
 
-export async function fetchWallet(ctx: Context, route?: string): Promise<WalletSnapshot | WalletError> {
+export async function fetchWallet(
+  ctx: Context,
+  route?: string,
+  filter: LedgerFilter = {},
+): Promise<WalletSnapshot | WalletError> {
   // accountForRoute 已经按 New API 指纹筛过（结果按 origin 缓存），所以这里不再重复探测。
   const account = await accountForRoute(ctx, route)
   if ('ok' in account && account.ok === false) return account
 
   // 查账凭据：只认 New API 访问令牌。sk- 模型密钥绝不发往用户级路由。
-  const accessKey = accessKeyForRoute(account.route)
-  if (accessKey === undefined) {
+  const token = accessKey()
+  if (token === undefined) {
     return { ok: false, error: 'no-access-token', detail: account.route }
   }
 
   try {
-    return await readNewApi(account, accessKey)
+    return await readNewApi(account, token, filter)
   } catch (error) {
     const name = error instanceof Error && error.name === 'AbortError' ? 'timeout' : 'unreachable'
     return { ok: false, error: name, detail: account.origin }
@@ -1033,7 +735,12 @@ export function resolveRefreshMs(): number {
   return Math.min(600_000, Math.max(10_000, Math.round(raw)))
 }
 
-export async function fetchBundle(ctx: Context, route?: string): Promise<WalletBundle> {
+
+export async function fetchBundle(
+  ctx: Context,
+  route?: string,
+  filter: LedgerFilter = {},
+): Promise<WalletBundle> {
   const accounts = await listAccounts(ctx)
   const selected = route !== undefined && accounts.some(account => account.route === route)
     ? route
@@ -1042,6 +749,6 @@ export async function fetchBundle(ctx: Context, route?: string): Promise<WalletB
     accounts,
     selected,
     refreshMs: resolveRefreshMs(),
-    wallet: await fetchWallet(ctx, selected === '' ? undefined : selected),
+    wallet: await fetchWallet(ctx, selected === '' ? undefined : selected, filter),
   }
 }
