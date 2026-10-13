@@ -21,10 +21,14 @@ export interface Money {
 /** 站点账本里的 token 桶。缺字段表示该路由没配密钥或站点没公布，不是 0。 */
 export interface TokenBuckets {
   requests?: number
+  /** 真正未命中的输入：prompt − 缓存命中 − 缓存写入。 */
   inputTokens?: number
   outputTokens?: number
+  /** 命中缓存读取的 prompt token（other.cache_tokens）。 */
   cacheReadTokens?: number
+  /** 写进缓存的 prompt token（other.cache_creation_tokens）。与命中读取是两回事，必须分开。 */
   cacheWriteTokens?: number
+  /** 合计 = 上面四桶之和（与账本行同源，不再取小时汇总）。 */
   totalTokens?: number
 }
 
@@ -54,7 +58,9 @@ export interface UsageAmounts {
   output?: Money
   /** 缓存命中部分的费用（与 buckets.cacheReadTokens 同口径）。 */
   cacheRead?: Money
-  /** 今日账本扫描范围内全部实扣合计（= input+output+cacheRead）。 */
+  /** 缓存写入部分的费用（与 buckets.cacheWriteTokens 同口径）。 */
+  cacheWrite?: Money
+  /** 今日账本扫描范围内全部实扣合计（= input+output+cacheRead+cacheWrite）。 */
   total?: Money
 }
 

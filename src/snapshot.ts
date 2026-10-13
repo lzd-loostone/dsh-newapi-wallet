@@ -8,15 +8,17 @@
  *   - /api/status、/api/pricing 匿名可访问。
  * 金额只来自网关账本，不做任何本地 token 估价。
  *
- * 计费公式（用真实账单核对到 0.15 元误差，勿删）：
- *   quota = (未缓存输入 + cache_tokens×cache_ratio + 输出×completion_ratio)
- *           × model_ratio × group_ratio
- * 本站点约 98% 的输入 token 是缓存命中，任何「tokens×价格」的本地估算会把
- * 成本高估约 6 倍 —— 所以金额永远以服务端算好的 quota 为准。
+ * 计费口径（勿退回旧写法）：网关已改用**表达式计费**，每条账本行的 other 里带
+ * expr_b64，解出来形如
+ *   tier("base", p * 0.15 + c * 0.5625 + cr * 0.015 + cc * 0.1875)
+ * 其中 p = prompt − cache_tokens − cache_creation_tokens（真正未命中的输入）、
+ * c = completion、cr = 缓存命中读取、cc = 缓存写入。
+ * 旧的 model_ratio / completion_ratio / cache_ratio 在新计费下**恒为 0**，
+ * 拿它们拆账会让分量之和为 0，整笔金额塌进「输入」一行（输出与缓存恒记 ¥0）。
  *
- * 金额拆分（今日按模型 / 输入-输出-缓存分桶）：比例取自每条账本行自带的 other
- * 字段，先算分量、再按该行真实 quota 回缩——拆分各分量之和恒等于账本金额，
- * 不引入任何本地估价，也不请求价目接口。
+ * 拆分方式：用表达式解出的单价算四个分量的相对权重，再按该行真实 quota 等比回缩——
+ * 权重是真的，合计也恒等于账本金额，不引入本地估价，不请求价目接口。
+ * 站点约 98% 的输入 token 是缓存，任何「tokens×标价」的本地估算都会把成本高估数倍。
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { fingerprintOrigin } from './fingerprint.ts'
@@ -622,9 +624,51 @@ async function fetchDailyHistory(
   }
 }
 
-/** /api/log/self 的 `other` 字段是 JSON 字符串：cache_tokens 与该笔实际使用的计费比例（账本自带）。 */
+/** 表达式计费解出的相对单价（美元 / 百万 token）。只需相对值：最终按真实 quota 回缩。 */
+interface TokenPrice {
+  /** 未缓存输入。 */
+  p: number
+  /** 输出。 */
+  c: number
+  /** 缓存命中读取。 */
+  cr: number
+  /** 缓存写入。 */
+  cc: number
+}
+
+/**
+ * 解 other.expr_b64（base64 的计费表达式），取四个变量的单价系数。
+ * 实测核对当日 580 行账本：把 p 当作 prompt − cacheRead − cacheWrite 后，
+ * 表达式算出的值 × (quota_per_unit / 1e6) 与账本 quota 误差 ≤ 0.5（纯取整）。
+ * 解不出任何系数（表达式换了形态）时返回 undefined，调用方退回旧版比例拆分。
+ */
+function parsePrice(exprB64: unknown): TokenPrice | undefined {
+  if (typeof exprB64 !== 'string' || exprB64 === '') return undefined
+  let expression: string
+  try {
+    expression = Buffer.from(exprB64, 'base64').toString('utf8')
+  } catch {
+    return undefined
+  }
+  const price: TokenPrice = { p: 0, c: 0, cr: 0, cc: 0 }
+  let hits = 0
+  for (const match of expression.matchAll(/\b(cc|cr|p|c)\s*\*\s*([0-9.]+)/g)) {
+    const value = Number(match[2])
+    if (!Number.isFinite(value) || value < 0) continue
+    price[match[1] as keyof TokenPrice] = value
+    hits += 1
+  }
+  return hits === 0 ? undefined : price
+}
+
+/**
+ * /api/log/self 的 `other` 字段是 JSON 字符串，自带这笔的 token 分桶与计费依据。
+ * cache_tokens 是命中读取，cache_creation_tokens 是写入缓存，两者互不包含。
+ */
 function parseOther(value: unknown): {
-  cacheTokens?: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  price?: TokenPrice
   modelRatio?: number
   completionRatio?: number
   cacheRatio?: number
@@ -633,13 +677,18 @@ function parseOther(value: unknown): {
   if (typeof value !== 'string' || value.trim() === '') return {}
   try {
     const parsed = JSON.parse(value) as Record<string, unknown>
-    const cacheTokens = num(parsed.cache_tokens)
+    const cacheReadTokens = num(parsed.cache_tokens)
+    // 同一笔在不同渠道下这两个键名二选一出现，实测共存时取值恒等。
+    const cacheWriteTokens = num(parsed.cache_creation_tokens) ?? num(parsed.cache_write_tokens)
+    const price = parsePrice(parsed.expr_b64)
     const modelRatio = num(parsed.model_ratio)
     const completionRatio = num(parsed.completion_ratio)
     const cacheRatio = num(parsed.cache_ratio)
     const groupRatio = num(parsed.group_ratio) ?? num(parsed.user_group_ratio)
     return {
-      ...(cacheTokens !== undefined ? { cacheTokens } : {}),
+      ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+      ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
+      ...(price !== undefined ? { price } : {}),
       ...(modelRatio !== undefined ? { modelRatio } : {}),
       ...(completionRatio !== undefined ? { completionRatio } : {}),
       ...(cacheRatio !== undefined ? { cacheRatio } : {}),
@@ -657,12 +706,17 @@ interface LedgerOutcome {
   records: CallRecord[]
   /** 今日扫描到的账本行数。 */
   rows: number
-  /** 未缓存输入 token（prompt − cache）全天合计。 */
+  /** 真正未命中的输入 token（prompt − 缓存命中 − 缓存写入）全天合计。 */
   inputTokens: number
   outputTokens: number
+  /** 命中缓存读取（other.cache_tokens）。 */
   cacheTokens: number
-  /** 金额分量（quota 点数）：回缩后 input+output+cacheRead 恒等于 total。 */
-  amountQuota: { input: number; output: number; cacheRead: number; total: number }
+  /** 写入缓存（other.cache_creation_tokens），与命中读取分开计。 */
+  cacheWriteTokens: number
+  /** 金额分量（quota 点数）：回缩后四桶之和恒等于 total。 */
+  amountQuota: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }
+  /** 按模型聚合（与 token 桶同源，都来自账本行，所以合计恒等于 amountQuota.total）。 */
+  models: Map<string, { quota: number; calls: number; tokens: number }>
   /** 服务端上报的今日总行数（data.total）。 */
   serverTotal?: number
   /** 今日行数超过分页上限，聚合只覆盖最近的部分。 */
@@ -692,7 +746,9 @@ async function fetchTodayLedger(
     inputTokens: 0,
     outputTokens: 0,
     cacheTokens: 0,
-    amountQuota: { input: 0, output: 0, cacheRead: 0, total: 0 },
+    cacheWriteTokens: 0,
+    amountQuota: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    models: new Map(),
     partial: false,
   }
   let page = 1
@@ -757,46 +813,70 @@ async function fetchTodayLedger(
           ...quota !== undefined ? { amount: quotaToMoney(quota, units) } : {},
           ...promptTokens !== undefined ? { promptTokens } : {},
           ...completionTokens !== undefined ? { completionTokens } : {},
-          ...other.cacheTokens !== undefined ? { cacheTokens: other.cacheTokens } : {},
+          ...other.cacheReadTokens !== undefined ? { cacheTokens: other.cacheReadTokens } : {},
           ...requestId !== undefined ? { requestId } : {},
           ...group !== undefined ? { group } : {},
           ...tokenName !== undefined ? { tokenName } : {},
         })
       }
-      // 全天聚合：token 桶 + 金额拆分。
+      // 全天聚合：token 四桶 + 金额拆分 + 按模型。
+      // token 口径：prompt 里可能同时含命中读取与写入缓存，两者都要先扣掉，
+      // 剩下的才是真正未命中的输入——否则 cache_creation 会被重复算进「输入」。
       const billedQuota = quota ?? 0
-      out.amountQuota.total += billedQuota
-      const cacheTok = Math.min(other.cacheTokens ?? 0, promptTokens ?? 0)
-      const uncached = Math.max((promptTokens ?? 0) - cacheTok, 0)
+      const prompt = promptTokens ?? 0
+      const cacheRead = Math.min(other.cacheReadTokens ?? 0, prompt)
+      const cacheWrite = Math.min(other.cacheWriteTokens ?? 0, prompt - cacheRead)
+      const uncached = Math.max(prompt - cacheRead - cacheWrite, 0)
+      const completion = completionTokens ?? 0
       out.inputTokens += uncached
-      out.outputTokens += completionTokens ?? 0
-      out.cacheTokens += cacheTok
-      const mr = other.modelRatio ?? 1
-      const cmr = other.completionRatio ?? 1
-      const cr = other.cacheRatio ?? 0
+      out.outputTokens += completion
+      out.cacheTokens += cacheRead
+      out.cacheWriteTokens += cacheWrite
+      out.amountQuota.total += billedQuota
+      if (model !== undefined) {
+        const hit = out.models.get(model)
+        if (hit === undefined) {
+          out.models.set(model, { quota: billedQuota, calls: 1, tokens: prompt + completion })
+        } else {
+          hit.quota += billedQuota
+          hit.calls += 1
+          hit.tokens += prompt + completion
+        }
+      }
+      // 分量权重：优先用表达式计费解出的真实单价；旧式 ratio 计费（未见表达式）时退回旧口径。
+      const price = other.price
       const gr = other.groupRatio ?? 1
-      let qIn = uncached * mr * gr
-      let qCache = cacheTok * cr * mr * gr
-      let qOut = (completionTokens ?? 0) * cmr * gr
-      const sum = qIn + qCache + qOut
+      const wIn = price !== undefined ? uncached * price.p : uncached * (other.modelRatio ?? 1) * gr
+      const wOut = price !== undefined ? completion * price.c : completion * (other.completionRatio ?? 1) * gr
+      const wRead = price !== undefined ? cacheRead * price.cr : cacheRead * (other.cacheRatio ?? 0) * (other.modelRatio ?? 1) * gr
+      const wWrite = price !== undefined ? cacheWrite * price.cc : 0
+      const sum = wIn + wOut + wRead + wWrite
+      let qIn: number
+      let qOut: number
+      let qRead: number
+      let qWrite: number
       if (billedQuota > 0 && sum > 0) {
         const k = billedQuota / sum
-        qIn *= k
-        qCache *= k
-        qOut *= k
+        qIn = wIn * k
+        qOut = wOut * k
+        qRead = wRead * k
+        qWrite = wWrite * k
       } else if (billedQuota > 0) {
-        // 比例缺失拆不动：整笔计入输入，不丢合计。
+        // 权重全为 0（既无表达式也无旧比例）：整笔计入输入，不丢合计。
         qIn = billedQuota
-        qCache = 0
         qOut = 0
+        qRead = 0
+        qWrite = 0
       } else {
         qIn = 0
-        qCache = 0
         qOut = 0
+        qRead = 0
+        qWrite = 0
       }
       out.amountQuota.input += qIn
-      out.amountQuota.cacheRead += qCache
       out.amountQuota.output += qOut
+      out.amountQuota.cacheRead += qRead
+      out.amountQuota.cacheWrite += qWrite
     }
     if (rawItems.length < LOG_PAGE_SIZE || fresh === 0) {
       // 最后一页（或整页重复的病态）：停止。
@@ -841,24 +921,32 @@ async function readNewApi(account: RouteAccount, accessKey: string): Promise<Wal
   // 近 4 周逐日消费（热力图）；失败/缺字段只是不渲染该区块。
   const dailyHistory = await fetchDailyHistory(account.origin, accessKey, units)
 
-  // 今日 token 桶：输入(未缓存)/输出/缓存来自全天账本行；合计用 data/self 聚合值。
+  // 今日 token 桶：四桶与合计一律来自全天账本行，彼此同源 —— 四桶之和恒等于合计，
+  // 不再取 /api/data/self 的小时汇总（那个口径当前小时滞后，会让合计与三行对不上，是旧缺陷）。
+  // 账本拿不到时才退回 data/self 的聚合值，并在页面上按缺字段呈现，不假装精确。
   let todayTokens: TokenBuckets | undefined
   let todayAmounts: UsageAmounts | undefined
+  let todayModels = today.models
   {
     const hasLedger = ledger.ok && ledger.rows > 0
     const requests = today.requests
-    const total = today.tokens?.totalTokens
     const inputTokens = hasLedger ? ledger.inputTokens : undefined
     const outputTokens = hasLedger ? ledger.outputTokens : undefined
     const cacheReadTokens = hasLedger ? ledger.cacheTokens : undefined
+    const cacheWriteTokens = hasLedger ? ledger.cacheWriteTokens : undefined
+    const total = hasLedger
+      ? ledger.inputTokens + ledger.outputTokens + ledger.cacheTokens + ledger.cacheWriteTokens
+      : today.tokens?.totalTokens
     const hasAny = inputTokens !== undefined || outputTokens !== undefined
-      || cacheReadTokens !== undefined || total !== undefined || requests !== undefined
+      || cacheReadTokens !== undefined || cacheWriteTokens !== undefined
+      || total !== undefined || requests !== undefined
     if (hasAny) {
       todayTokens = {
         ...(requests !== undefined ? { requests } : {}),
         ...(inputTokens !== undefined ? { inputTokens } : {}),
         ...(outputTokens !== undefined ? { outputTokens } : {}),
         ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+        ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
         ...(total !== undefined ? { totalTokens: total } : {}),
       }
     }
@@ -867,7 +955,21 @@ async function readNewApi(account: RouteAccount, accessKey: string): Promise<Wal
         input: quotaToMoney(round6(ledger.amountQuota.input), units),
         output: quotaToMoney(round6(ledger.amountQuota.output), units),
         cacheRead: quotaToMoney(round6(ledger.amountQuota.cacheRead), units),
+        cacheWrite: quotaToMoney(round6(ledger.amountQuota.cacheWrite), units),
         total: quotaToMoney(round6(ledger.amountQuota.total), units),
+      }
+      // 按模型拆分改用账本行聚合：与上方四桶、与账本合计同源，
+      // quota 合计恒等于 todayAmounts.total（旧版取 data/self，当前小时会少一截）。
+      if (ledger.models.size > 0) {
+        todayModels = [...ledger.models.entries()]
+          .map(([model, row]) => ({
+            model,
+            quota: round6(row.quota),
+            calls: row.calls,
+            tokens: row.tokens,
+            amount: quotaToMoney(round6(row.quota), units),
+          }))
+          .sort((a, b) => b.quota - a.quota)
       }
     }
   }
@@ -893,7 +995,7 @@ async function readNewApi(account: RouteAccount, accessKey: string): Promise<Wal
     ...dailyHistory !== undefined ? { dailyHistory } : {},
     ...ledger.ok && ledger.rows > 0 ? { todayLogRows: ledger.rows } : {},
     ...ledger.ok && ledger.partial ? { todayLogsPartial: true } : {},
-    ...today.models !== undefined && today.models.length > 0 ? { todayModels: today.models } : {},
+    ...todayModels !== undefined && todayModels.length > 0 ? { todayModels } : {},
     ...recentCalls !== undefined && recentCalls.length > 0 ? { recentCalls } : {},
     ...today.rate !== undefined ? { rate: today.rate } : {},
     scheme: 'newapi',

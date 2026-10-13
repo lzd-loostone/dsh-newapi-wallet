@@ -432,6 +432,8 @@ function BucketRows({
     { name: '输出', value: fmtCount(buckets.outputTokens), amount: amounts?.output },
   ]
   if (buckets.cacheReadTokens !== undefined) rows.push({ name: '缓存命中', value: fmtCount(buckets.cacheReadTokens), amount: amounts?.cacheRead })
+  // 缓存写入与缓存命中是两桶：写入按原价计费，命中才打折。旧版把写入并进「输入」，会虚高。
+  if (buckets.cacheWriteTokens !== undefined) rows.push({ name: '缓存写入', value: fmtCount(buckets.cacheWriteTokens), amount: amounts?.cacheWrite })
   if (buckets.totalTokens !== undefined) rows.push({ name: '合计 token', value: fmtCount(buckets.totalTokens), amount: amounts?.total })
   return (
     <div className="gww_section">
@@ -786,7 +788,7 @@ function WalletBody({
         <BucketRows title="今日用量" buckets={snapshot.todayTokens} amounts={snapshot.todayAmounts} />
       )}
       {snapshot.todayLogsPartial === true && (
-        <p className="gww_note">今日账单超过 1000 条，token 与金额拆分按最近 1000 条统计。</p>
+        <p className="gww_note">今日账单超过 1000 条，token、金额与按模型拆分都只按最近 1000 条统计。</p>
       )}
       {snapshot.dailyHistory !== undefined && snapshot.dailyHistory.length > 0 && (
         <HeatmapSection points={snapshot.dailyHistory} />

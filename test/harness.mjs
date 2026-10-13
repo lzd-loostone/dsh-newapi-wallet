@@ -170,22 +170,61 @@ const leaks = []
 // 这条断言防的是历史上那个真缺陷：客户端用写死的 45s，设置里的 refreshMs 全链路无人读取。
 if (payload.refreshMs === 15000) console.log('    ✓ 宿主按设置下发 refreshMs = 15000')
 else leaks.push('refreshMs 未按设置下发（得到 ' + JSON.stringify(payload.refreshMs) + '，期望 15000）')
-// 金额展示断言（0.1.7）：按模型每行必须带 ¥；分桶金额之和必须等于合计。
+// 金额与 token 拆分断言（0.1.9）：网关改用 tiered_expr 表达式计费后，other 里的
+// model_ratio/completion_ratio/cache_ratio 恒为 0，旧口径会把整笔金额塌进「输入」一行，
+// 输出与缓存金额恒为 0，且漏掉 cache_creation（缓存写入）整桶。下面五条盯死这四种病征。
 {
   const tm = Array.isArray(w.todayModels) ? w.todayModels : []
   if (tm.length === 0) leaks.push('todayModels 为空，按模型金额无从校验')
   else if (tm.some(m => !m.amount || typeof m.amount.display !== 'number' || m.amount.currency !== 'CNY')) leaks.push('todayModels 有行缺 amount.display/CNY')
   else console.log('    ✓ 今日按模型每行都带 ¥ 金额')
+
   const a = w.todayAmounts
+  const tk = w.todayTokens
   if (!a) leaks.push('缺 todayAmounts')
+  else if (!tk) leaks.push('缺 todayTokens')
   else {
-    const parts = [a.input, a.output, a.cacheRead].map(x => typeof x?.display === 'number' ? x.display : NaN)
+    // (1) 四桶 token 之和必须恒等于「合计 token」——漏掉 cacheWrite 桶就会在这里露馅。
+    const buckets = [tk.inputTokens, tk.outputTokens, tk.cacheReadTokens, tk.cacheWriteTokens]
+    if (buckets.some(x => typeof x !== 'number')) {
+      leaks.push('token 四桶不全（cacheWriteTokens=' + JSON.stringify(tk.cacheWriteTokens) + '）')
+    } else {
+      const bSum = buckets.reduce((x, y) => x + y, 0)
+      if (bSum !== tk.totalTokens) leaks.push('token 四桶之和(' + bSum + ') != 合计 token(' + tk.totalTokens + ')')
+      else console.log('    ✓ 未缓存输入+输出+缓存命中+缓存写入 == 合计 token (' + bSum + ')')
+    }
+    // (2) 四桶金额之和必须恒等于拆分合计。
+    const parts = [a.input, a.output, a.cacheRead, a.cacheWrite].map(x => typeof x?.display === 'number' ? x.display : NaN)
     const sum = parts.reduce((x, y) => x + y, 0)
-    if (parts.some(Number.isNaN) || !a.total || typeof a.total.display !== 'number') leaks.push('todayAmounts 分桶金额不全')
-    else if (Math.abs(sum - a.total.display) > 0.005) leaks.push('分桶金额之和 != 合计 (' + sum + ' vs ' + a.total.display + ')')
-    else console.log('    ✓ 输入+输出+缓存 金额之和 == 合计 (¥' + a.total.display.toFixed(2) + ')')
-    if (w.today && typeof w.today.display === 'number' && a.total) {
-      console.log('    ⓘ 今日实扣(stat) ¥' + w.today.display.toFixed(2) + ' vs 账本逐条合计 ¥' + a.total.display.toFixed(2))
+    if (parts.some(Number.isNaN) || !a.total || typeof a.total.display !== 'number') leaks.push('todayAmounts 四桶金额不全（cacheWrite=' + JSON.stringify(a.cacheWrite) + '）')
+    else if (Math.abs(sum - a.total.display) > 0.005) leaks.push('四桶金额之和 != 合计 (' + sum + ' vs ' + a.total.display + ')')
+    else console.log('    ✓ 四桶金额之和 == 合计 (¥' + a.total.display.toFixed(2) + ')')
+    // (3) 拆分不得塌陷：某桶 token 非零时，它的金额也必须非零。
+    //     这正是 tiered_expr 回归的病征——旧口径下输出与缓存金额恒为 ¥0.00。
+    const collapsed = []
+    for (const [name, tokens, money] of [
+      ['输出', tk.outputTokens, a.output],
+      ['缓存命中', tk.cacheReadTokens, a.cacheRead],
+      ['缓存写入', tk.cacheWriteTokens, a.cacheWrite],
+    ]) {
+      if (typeof tokens === 'number' && tokens > 0 && !(typeof money?.display === 'number' && money.display > 0)) {
+        collapsed.push(name + '(token ' + tokens + ' 却记 ¥' + (money?.display ?? '—') + ')')
+      }
+    }
+    if (collapsed.length > 0) leaks.push('金额拆分塌陷：' + collapsed.join('，'))
+    else console.log('    ✓ 输出/缓存命中/缓存写入 三桶金额均未塌陷为 0')
+    // (4) 按模型合计必须与账本合计同源一致（旧口径用 /api/data/self 小时汇总，当前小时滞后）。
+    if (tm.length > 0 && a.total) {
+      const mSum = tm.reduce((x, r) => x + (r.quota ?? 0), 0)
+      const d = Math.abs(mSum - (a.total.quota ?? 0))
+      if (d !== 0) leaks.push('按模型 quota 合计(' + mSum + ') != 账本合计(' + a.total.quota + ')，差 ' + d)
+      else console.log('    ✓ 按模型 quota 合计 == 账本逐条合计 (' + mSum + ')')
+    }
+    // (5) 头部「今日实扣」与账本合计同为实时口径，偏差只允许取整级。
+    if (w.today && typeof w.today.quota === 'number' && typeof a.total?.quota === 'number') {
+      const d = Math.abs(w.today.quota - a.total.quota)
+      if (d > Math.max(2000, a.total.quota * 0.01)) leaks.push('今日实扣(stat)与账本合计偏差过大：' + w.today.quota + ' vs ' + a.total.quota)
+      else console.log('    ✓ 今日实扣(stat) 与账本合计一致 (quota ' + w.today.quota + ' vs ' + a.total.quota + ')')
     }
   }
 }

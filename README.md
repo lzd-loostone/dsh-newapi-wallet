@@ -14,12 +14,12 @@
 
 ## 为什么不是本地估算
 
-一条真实调用的输入里通常大部分是**缓存命中**，而缓存命中按 `cache_ratio` 折价计费。用 `prompt + completion × 倍率` 直接乘单价会显著高估实际花费（缓存占比越高，偏差越大）。本插件因此只读网关已经算好的 `quota`，再按网关自身声明的换算常数显示为对应币种。
+一条真实调用的输入里通常大部分是**缓存命中**，缓存命中按折价单价计费（本站点为未缓存输入的十分之一），缓存**写入**按另一档单价计费。用 `prompt + completion × 倍率` 直接乘单价会显著高估实际花费（缓存占比越高，偏差越大）。本插件因此只读网关已经算好的 `quota`，再按网关自身声明的换算常数显示为对应币种。
 
 ## 功能
 
 - 侧边栏底部一个入口，徽标直接显示**今日实扣金额**
-- 点开面板：余额 / 今日实扣 / 累计已用三卡、**今日按模型拆分（每行带 ¥）**、今日用量分桶（未缓存输入 / 输出 / 缓存命中，每行带对应 ¥ 金额，三行之和恒等于今日实扣）、**近 4 周逐日消费热力图**（颜色深浅 = 当日实扣，格内日号、每月 1 号显示「X月」，悬停弹卡看金额与次数，零消费与「网关没留记录」是两种格子）、最近若干条**逐条消费明细**（模型、单笔金额、token 构成、分组、令牌名）
+- 点开面板：余额 / 今日实扣 / 累计已用三卡、**今日按模型拆分（每行带 ¥）**、今日用量分桶（未缓存输入 / 输出 / 缓存命中 / 缓存写入，每行带对应 ¥ 金额，四行之和恒等于今日实扣）、**近 4 周逐日消费热力图**（颜色深浅 = 当日实扣，格内日号、每月 1 号显示「X月」，悬停弹卡看金额与次数，零消费与「网关没留记录」是两种格子）、最近若干条**逐条消费明细**（模型、单笔金额、token 构成、分组、令牌名）
 - 面板顶部一排横向滚动的**供应商卡片**：从 DSH 已配置的模型路由里自动探测出哪些是 New API 站点，**只列这些**，并自动选中当前模型所在的那条；切换卡片即切换账本
 - 每张卡片带**「配置令牌」**按钮：在弹窗里填写或修改该供应商的访问令牌，也可勾选「作为所有供应商的默认令牌」，**保存后即时生效，不用重启**
 - 唯一入口就是左下角这个「账本」，不往设置页插任何座位
@@ -32,22 +32,22 @@
 
 ```sh
 # GitHub（推荐）：pnpm 会规范化为 hosted 规格，直接下载匿名 HTTPS tarball 并按 commit SHA 锁定
-dsh plugin --profile web add "github:lzd-loostone/dsh-newapi-wallet#v0.1.8"
+dsh plugin --profile web add "github:lzd-loostone/dsh-newapi-wallet#v0.2.1"
 
 # 等价的显式 HTTPS git 地址（效果同上，锁文件里仍会记成 hosted 规格）
-dsh plugin --profile web add "https://github.com/lzd-loostone/dsh-newapi-wallet.git#v0.1.8"
+dsh plugin --profile web add "https://github.com/lzd-loostone/dsh-newapi-wallet.git#v0.2.1"
 
 # 也可以直接给归档 tarball 地址
-dsh plugin --profile web add "https://codeload.github.com/lzd-loostone/dsh-newapi-wallet/tar.gz/refs/tags/v0.1.8"
+dsh plugin --profile web add "https://codeload.github.com/lzd-loostone/dsh-newapi-wallet/tar.gz/refs/tags/v0.2.1"
 
 # 或从内部 npm registry
-dsh plugin --profile web add @loostone/dsh-newapi-wallet@0.1.8
+dsh plugin --profile web add @loostone/dsh-newapi-wallet@0.2.1
 
 # 或分发本地 tarball 文件
-dsh plugin --profile web add <路径>\loostone-dsh-newapi-wallet-0.1.8.tgz
+dsh plugin --profile web add <路径>\loostone-dsh-newapi-wallet-0.2.1.tgz
 ```
 
-- **请钉 tag 或 commit**（`#v0.1.8`），不要写 `#main`/`#master`：pnpm 会把 tag 解析成具体 commit 并把 `codeload` 的 SHA 地址写进 `pnpm-lock.yaml`，同事之间装到的字节完全一致。
+- **请钉 tag 或 commit**（`#v0.2.1`），不要写 `#main`/`#master`：pnpm 会把 tag 解析成具体 commit 并把 `codeload` 的 SHA 地址写进 `pnpm-lock.yaml`，同事之间装到的字节完全一致。
 - 预构建产物 `lib/` 已入库，所以**安装不触发任何构建脚本**，也不会被 pnpm 的构建脚本策略拦截。
 - 零运行时依赖。
 - 用本地 `.tgz` 安装时注意：pnpm 会把它记成 `file:` 依赖，**装完那个文件不能删也不能挪**，否则以后每次 `dsh plugin` / `pnpm install` 都会因解析不到路径而失败。上面的 URL 方式无此约束。
@@ -87,10 +87,20 @@ New API 网页端 **个人设置 → 访问令牌** 生成一串（**不是** `s
 
 ```
 显示金额 = quota / quota_per_unit × usd_exchange_rate      （币种取 quota_display_type）
-quota    = (未缓存输入 + 缓存命中 × cache_ratio + 输出 × completion_ratio) × model_ratio × group_ratio
+quota    = 该行计费表达式的结果 × quota_per_unit / 1e6
 ```
 
-面板上的每一笔金额都来自网关已经记账的 `quota`。分桶金额（未缓存输入 / 输出 / 缓存命中）的口径：`/api/log/self` 的每条账单在 `other` 字段里**自带这笔实际使用的比例**（`model_ratio` / `completion_ratio` / `cache_ratio` / `group_ratio`），先按比例算出三个分量，再按该行真实 `quota` 等比回缩——分量之和恒等于账本金额。**不请求价目接口，也不做本地估价。**
+面板上的每一笔金额都来自网关已经记账的 `quota`。分桶金额（未缓存输入 / 输出 / 缓存命中 / 缓存写入）的口径：`/api/log/self` 的每条账单在 `other` 里**自带这笔的计费表达式** `expr_b64`，解出来形如
+
+```
+tier("base", p * 0.15 + c * 0.5625 + cr * 0.015 + cc * 0.1875)
+```
+
+其中 `p` = 未缓存输入、`c` = 输出、`cr` = 缓存命中、`cc` = 缓存写入。用解出的四个单价算分量权重，再按该行真实 `quota` 等比回缩——权重是真的，四桶之和恒等于账本金额。**不请求价目接口，也不做本地估价。**
+
+token 桶同源：`prompt_tokens` 里可能同时含缓存命中与缓存写入，两者都扣掉后才是真正的「未缓存输入」。四桶之和恒等于「合计 token」。
+
+> ⚠️ 改取数逻辑时注意：网关的计费方式换过一次。旧版按 `other.model_ratio` / `completion_ratio` / `cache_ratio` 拆分，**这三个字段在表达式计费下恒为 0**——照旧写法拆，分量权重全为 0，整笔金额会塌进「输入」一行，输出与缓存恒显 ¥0.00，且 `cache_creation_tokens` 整桶丢失。`src/snapshot.ts` 的 `parsePrice()` 解表达式；解不出时自动退回旧比例口径，不会算错总数。`test/harness.mjs` 里有五条断言盯死这四种病征。
 
 ## 使用的接口
 
@@ -99,8 +109,8 @@ quota    = (未缓存输入 + 缓存命中 × cache_ratio + 输出 × completion
 | `/api/status` | 匿名 | 读取换算常数与站点信息；同时是唯一的网关类型探针 |
 | `/api/user/self` | 访问令牌 | 账户、余额、累计用量 |
 | `/api/log/self/stat` | 访问令牌 | 今日实扣；热力图「今天」格与 data/self 缺口日的逐日补探 |
-| `/api/data/self` | 访问令牌 | 今日按模型拆分；近 4 周逐日金额（小时行按本地日期聚合） |
-| `/api/log/self` | 访问令牌 | 逐条消费明细；输入/输出/缓存分桶金额（全天分页聚合） |
+| `/api/data/self` | 访问令牌 | 近 4 周逐日金额（小时行按本地日期聚合）；账本不可用时兜底今日合计 |
+| `/api/log/self` | 访问令牌 | 逐条消费明细；输入/输出/缓存命中/缓存写入分桶金额与 per-model 聚合（全天分页聚合） |
 
 网关类型识别只靠匿名 `/api/status`：New API 会正常返回站点信息，其他中转站不会。探测结果按 origin 缓存，**非 New API 的模型路由不会出现在卡片列表里**（若一条都没探出来，面板会列出每条路由的失败原因）。本插件不调用任何 token 级接口，因此不受那类接口限流影响。
 
