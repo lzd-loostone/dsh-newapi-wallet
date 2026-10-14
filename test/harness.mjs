@@ -747,39 +747,31 @@ console.log('\n  --- 客户端半：座位与配置页注册 ---')
       if (grids.length !== 3) {
         leaks.push('单条调用卡每笔应有一个两行网格（共 3 个），得到 ' + grids.length)
       } else {
-        const line = cellsOf(grids[0])
-        // 4 格 = 2 行 × 2 列，这是「刚好两行」的硬判据。
-        if (line.length !== 4) {
-          leaks.push('单条调用卡应恰好两行（每行两格，共 4 格），得到 ' + line.length + ' 格：' + JSON.stringify(line.map(textOf)))
-        } else if (!/^\d{2}:\d{2} input: 100\.618K$/.test(textOf(line[0]))) {
-          leaks.push('第一行左格应为「时间 input: 值」，得到 ' + JSON.stringify(textOf(line[0])))
-        } else if (!/^缓存 56\.96K · 56\.6%$/.test(textOf(line[1])) || line[1].props['data-level'] !== 'bad') {
-          leaks.push('第一行右格应为红档缓存命中，得到 ' + JSON.stringify({ text: textOf(line[1]), level: line[1].props['data-level'] }))
-        } else if (!/^公司 win new output: 588$/.test(textOf(line[2]))) {
-          leaks.push('第二行左格应为「令牌名 output: 值」，得到 ' + JSON.stringify(textOf(line[2])))
-        } else if (!/^¥/.test(textOf(line[3]))) {
-          leaks.push('第二行右格应为 ¥ 金额，得到 ' + JSON.stringify(textOf(line[3])))
-        } else {
-          console.log('    ✓ 恰好两行：第一行「' + textOf(line[0]) + ' | ' + textOf(line[1]) + '」，第二行「' + textOf(line[2]) + ' | ' + textOf(line[3]) + '」')
-        }
-        // 无缓存的一笔：那一格必须留空且不给档位（空 auto 列零宽，不会撑开右边缘）。
-        const line2 = cellsOf(grids[1])
-        const cache2 = collect(grids[1], 'gww_tokCache')
-        if (cache2.length !== 1) leaks.push('无缓存的一笔缓存格应保留 1 个（占右对齐位），得到 ' + cache2.length)
-        else if (textOf(cache2[0]) !== '' || cache2[0].props['data-level'] !== undefined) {
-          leaks.push('无缓存的一笔缓存格必须留空（不写「缓存 0」，也不给档位），得到 ' + JSON.stringify({ text: textOf(cache2[0]), level: cache2[0].props['data-level'] }))
-        } else if (line2.length !== 4 || textOf(line2[3]).indexOf('¥') !== 0) {
-          leaks.push('无缓存的一笔仍是两行两格、金额在右下，得到 ' + JSON.stringify(line2.map(textOf)))
-        } else {
-          console.log('    ✓ 无缓存的一笔：缓存格留空、金额仍在右下')
-        }
-        // 网关偶发缺用量：写 — 不摆 0（0 会被读成「真的用了 0」）。
-        const line3 = cellsOf(grids[2])
-        if (line3.length !== 4 || !/input: —$/.test(textOf(line3[0])) || textOf(line3[2]) !== 'output: —') {
-          leaks.push('缺用量的一笔应写「input: —」「output: —」且仍是两行两格，得到 ' + JSON.stringify(line3.map(textOf)))
-        } else {
-          console.log('    ✓ 缺用量的一笔：写 — 不摆 0')
-        }
+        // 版式契约（三笔共用一套）：4 格 = 2 行 × 2 列。
+        //   第一行「时间 - 令牌名 | ¥金额」，第二行「input: 值  output: 值 | 缓存命中率」。
+        //   缺用量写 —（不摆 0，0 会被读成「真的用了 0」）；无缓存那一格留空（空 auto 列零宽）。
+        const cards = [
+          { name: '有缓存', head: /^\d{2}:\d{2} - 公司 win new$/, io: ['input: 100.618K', 'output: 588'], cache: /^缓存 56\.96K · 56\.6%$/, level: 'bad' },
+          { name: '无缓存', head: /^\d{2}:\d{2} - dgx$/, io: ['input: 1.2K', 'output: 30'], cache: null, level: undefined },
+          { name: '缺用量', head: /^\d{2}:\d{2}$/, io: ['input: —', 'output: —'], cache: null, level: undefined },
+        ]
+        const bad = []
+        cards.forEach((want, i) => {
+          const line = cellsOf(grids[i])
+          if (line.length !== 4) { bad.push(want.name + '：应恰好两行两格（4 格），得到 ' + line.length + ' 格'); return }
+          if (!want.head.test(textOf(line[0]))) bad.push(want.name + '：第一行左格应「时间 - 令牌名」，得到 ' + JSON.stringify(textOf(line[0])))
+          if (!/^¥/.test(textOf(line[1]))) bad.push(want.name + '：第一行右格应 ¥ 金额，得到 ' + JSON.stringify(textOf(line[1])))
+          const io = cellsOf(line[2]).map(textOf)
+          if (JSON.stringify(io) !== JSON.stringify(want.io)) bad.push(want.name + '：第二行左格应并排 ' + JSON.stringify(want.io) + '，得到 ' + JSON.stringify(io))
+          const cache = textOf(line[3])
+          if (want.cache === null) {
+            if (cache !== '' || line[3].props['data-level'] !== undefined) bad.push(want.name + '：缓存格应留空且无档位，得到 ' + JSON.stringify({ text: cache, level: line[3].props['data-level'] }))
+          } else if (!want.cache.test(cache) || line[3].props['data-level'] !== want.level) {
+            bad.push(want.name + '：第二行右格应是 ' + want.level + ' 档缓存，得到 ' + JSON.stringify({ text: cache, level: line[3].props['data-level'] }))
+          }
+        })
+        if (bad.length > 0) leaks.push('单条调用卡版式不对：' + bad.join('；'))
+        else console.log('    ✓ 恰好两行两格：第一行「时间 - 令牌名 | ¥金额」，第二行「input | output | 缓存」，三笔都对')
       }
       // 页脚（网关地址 · 读取时间）归左列列底，不跟右列。
       const colL = collect(tree, 'gww_colL')
@@ -797,6 +789,8 @@ console.log('\n  --- 客户端半：座位与配置页注册 ---')
       else console.log('    ✓ 旧卡片结构（首行 + 三栏网格）已完全退场')
       if (!source.includes('.gww_callGrid{display:grid;grid-template-columns:minmax(0,1fr) auto')) {
         leaks.push('两行网格没有声明 minmax(0,1fr) / auto 两列（左格居左可省略、右格居右）')
+      } else if (!source.includes('.gww_callIO{display:grid;grid-template-columns:minmax(0,16ch) auto')) {
+        leaks.push('input / output 的列宽不固定，output: 无法跨行对齐（应 grid + minmax(0,16ch) auto）')
       } else if (!source.includes('.gww_tokCache[data-level="ok"]') || !source.includes('.gww_tokCache[data-level="bad"]')) {
         leaks.push('缓存格没有按 ok / bad 档位配色')
       } else {

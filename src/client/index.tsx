@@ -167,6 +167,9 @@ const CSS = [
   // 单笔恰好两行、每行两格：左格居左（过长省略号截断，不挤走右格），右格居右，两行右边缘对齐。
   '.gww_callGrid{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:0 10px;align-items:baseline;font-size:11px;line-height:16px;color:var(--dsw-alias-label-caption);font-variant-numeric:tabular-nums}',
   '.gww_callCell{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+  // input / output 并排在第二行左格：第一列固定 16ch（够放「input: 999.999K」），
+  // 于是每张卡片的 output: 都从同一个 x 开始，跨行对齐。窄了先收列宽，不换行、不重叠。
+  '.gww_callIO{display:grid;grid-template-columns:minmax(0,16ch) auto;gap:0 10px}',
   '.gww_callAmount{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;font-weight:500;text-align:right;white-space:nowrap}',
   // 命中率配色：≥96% 绿 / 80~96% 黄 / <80% 红。黄档没有对应 alias，用主题的静态 amber。
   '.gww_tokCache{text-align:right;white-space:nowrap}',
@@ -587,13 +590,15 @@ function CallRows({ calls }: { calls: CallRecord[] }) {
           <div key={call.requestId ?? `${call.createdAt}-${index}`} className="gww_call">
             <div className="gww_callGrid">
               <span className="gww_callCell">
-                {clockLabel(call.createdAt)} input: {usage ? fmtTokens(call.promptTokens ?? 0) : '—'}
-              </span>
-              <span className="gww_tokCache" data-level={hint?.level}>{hint?.text}</span>
-              <span className="gww_callCell">
-                {call.tokenName !== undefined ? `${call.tokenName} ` : ''}output: {usage ? fmtTokens(call.completionTokens ?? 0) : '—'}
+                {clockLabel(call.createdAt)}
+                {call.tokenName !== undefined ? ` - ${call.tokenName}` : ''}
               </span>
               <span className="gww_callAmount">{fmtMoney(call.amount)}</span>
+              <span className="gww_callCell gww_callIO">
+                <span>input: {usage ? fmtTokens(call.promptTokens ?? 0) : '—'}</span>
+                <span>output: {usage ? fmtTokens(call.completionTokens ?? 0) : '—'}</span>
+              </span>
+              <span className="gww_tokCache" data-level={hint?.level}>{hint?.text}</span>
             </div>
           </div>
         )
