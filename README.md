@@ -25,7 +25,8 @@
 - **左列只负责「选」，自身永不收窄**：两个列表恒为全天口径。否则一点某行，列表自己就塌成 1 行，再也点不回别的分组
 - 筛选只作用于右列的「今日用量」与「最近调用」；头部实扣、热力图与左列两个列表恒为全天口径
 - **单条调用的展示规则**：恰好两行、每行两格，左格居左右格居右（两行共用 `1fr auto` 两列，右边缘对齐）——
-  第一行「`09:22 - 公司 win new` | `¥0.0249`」，第二行「`input: 194.329K` `output: 1.914K` | `缓存 193.408K · 99.5%`」。
+  第一行「`09:22 - 公司 win new` | `deepseek-v4.1-flash ¥0.0249`」，第二行「`input: 194.329K` `output: 1.914K` | `缓存 193.408K · 99.5%`」。
+  模型名在金额左侧、比金额暗一档（钱是这张卡唯一的高亮）；网关没给模型字段时只显示金额，不漏 `undefined`。
   input 与 output 并排在第二行左格，不是上下两行：第一列固定 `16ch`（`grid-template-columns:minmax(0,16ch) auto`），
   于是每张卡片的 `output:` 都从同一个 x 开始——这就是制表位的效果，但列宽确定，不吃字体的度量差异。
   命中率 = 缓存读取 ÷ 输入总量（prompt 含缓存读取与缓存写入），三档配色：**≥96% 绿 / 80~96% 黄 / <80% 红**；
@@ -66,22 +67,22 @@
 
 ```sh
 # GitHub（推荐）：pnpm 会规范化为 hosted 规格，直接下载匿名 HTTPS tarball 并按 commit SHA 锁定
-dsh plugin --profile web add "github:lzd-loostone/dsh-newapi-wallet#v0.2.3"
+dsh plugin --profile web add "github:lzd-loostone/dsh-newapi-wallet#v0.2.4"
 
 # 等价的显式 HTTPS git 地址（效果同上，锁文件里仍会记成 hosted 规格）
-dsh plugin --profile web add "https://github.com/lzd-loostone/dsh-newapi-wallet.git#v0.2.3"
+dsh plugin --profile web add "https://github.com/lzd-loostone/dsh-newapi-wallet.git#v0.2.4"
 
 # 也可以直接给归档 tarball 地址
-dsh plugin --profile web add "https://codeload.github.com/lzd-loostone/dsh-newapi-wallet/tar.gz/refs/tags/v0.2.3"
+dsh plugin --profile web add "https://codeload.github.com/lzd-loostone/dsh-newapi-wallet/tar.gz/refs/tags/v0.2.4"
 
 # 或从内部 npm registry
-dsh plugin --profile web add @loostone/dsh-newapi-wallet@0.2.3
+dsh plugin --profile web add @loostone/dsh-newapi-wallet@0.2.4
 
 # 或分发本地 tarball 文件
-dsh plugin --profile web add <路径>\loostone-dsh-newapi-wallet-0.2.3.tgz
+dsh plugin --profile web add <路径>\loostone-dsh-newapi-wallet-0.2.4.tgz
 ```
 
-- **请钉 tag 或 commit**（`#v0.2.3`），不要写 `#main`/`#master`：pnpm 会把 tag 解析成具体 commit 并把 `codeload` 的 SHA 地址写进 `pnpm-lock.yaml`，同事之间装到的字节完全一致。
+- **请钉 tag 或 commit**（`#v0.2.4`），不要写 `#main`/`#master`：pnpm 会把 tag 解析成具体 commit 并把 `codeload` 的 SHA 地址写进 `pnpm-lock.yaml`，同事之间装到的字节完全一致。
 - 预构建产物 `lib/` 已入库，所以**安装不触发任何构建脚本**，也不会被 pnpm 的构建脚本策略拦截。
 - 零运行时依赖。
 - 用本地 `.tgz` 安装时注意：pnpm 会把它记成 `file:` 依赖，**装完那个文件不能删也不能挪**，否则以后每次 `dsh plugin` / `pnpm install` 都会因解析不到路径而失败。上面的 URL 方式无此约束。

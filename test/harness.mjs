@@ -729,7 +729,7 @@ console.log('\n  --- 客户端半：座位与配置页注册 ---')
         recentCalls: [
           { createdAt: Date.now(), model: 'gpt-6-luna', quota: 100, amount: money(100), promptTokens: 100618, completionTokens: 588, cacheTokens: 56960, cacheWriteTokens: 0, requestId: 'r1', tokenName: '公司 win new' },
           { createdAt: Date.now(), model: 'glm-5.3-flash', quota: 10, amount: money(10), promptTokens: 1200, completionTokens: 30, cacheTokens: 0, cacheWriteTokens: 0, requestId: 'r2', tokenName: 'dgx' },
-          { createdAt: Date.now(), model: 'qwen3.8-flash', quota: 0, amount: money(0), cacheTokens: 0, cacheWriteTokens: 0, requestId: 'r3' },
+          { createdAt: Date.now(), quota: 0, amount: money(0), cacheTokens: 0, cacheWriteTokens: 0, requestId: 'r3' },
         ],
       }
       const collect = (node, cls, out = []) => {
@@ -748,19 +748,22 @@ console.log('\n  --- 客户端半：座位与配置页注册 ---')
         leaks.push('单条调用卡每笔应有一个两行网格（共 3 个），得到 ' + grids.length)
       } else {
         // 版式契约（三笔共用一套）：4 格 = 2 行 × 2 列。
-        //   第一行「时间 - 令牌名 | ¥金额」，第二行「input: 值  output: 值 | 缓存命中率」。
+        //   第一行「时间 - 令牌名 | 模型名 ¥金额」，第二行「input: 值  output: 值 | 缓存命中率」。
         //   缺用量写 —（不摆 0，0 会被读成「真的用了 0」）；无缓存那一格留空（空 auto 列零宽）。
         const cards = [
-          { name: '有缓存', head: /^\d{2}:\d{2} - 公司 win new$/, io: ['input: 100.618K', 'output: 588'], cache: /^缓存 56\.96K · 56\.6%$/, level: 'bad' },
-          { name: '无缓存', head: /^\d{2}:\d{2} - dgx$/, io: ['input: 1.2K', 'output: 30'], cache: null, level: undefined },
-          { name: '缺用量', head: /^\d{2}:\d{2}$/, io: ['input: —', 'output: —'], cache: null, level: undefined },
+          { name: '有缓存', head: /^\d{2}:\d{2} - 公司 win new$/, money: /^gpt-6-luna ¥/, io: ['input: 100.618K', 'output: 588'], cache: /^缓存 56\.96K · 56\.6%$/, level: 'bad' },
+          { name: '无缓存', head: /^\d{2}:\d{2} - dgx$/, money: /^glm-5\.3-flash ¥/, io: ['input: 1.2K', 'output: 30'], cache: null, level: undefined },
+          { name: '缺用量缺模型', head: /^\d{2}:\d{2}$/, money: /^¥/, io: ['input: —', 'output: —'], cache: null, level: undefined },
         ]
         const bad = []
         cards.forEach((want, i) => {
           const line = cellsOf(grids[i])
           if (line.length !== 4) { bad.push(want.name + '：应恰好两行两格（4 格），得到 ' + line.length + ' 格'); return }
           if (!want.head.test(textOf(line[0]))) bad.push(want.name + '：第一行左格应「时间 - 令牌名」，得到 ' + JSON.stringify(textOf(line[0])))
-          if (!/^¥/.test(textOf(line[1]))) bad.push(want.name + '：第一行右格应 ¥ 金额，得到 ' + JSON.stringify(textOf(line[1])))
+          // 右格 = 模型名（可缺）+ 空格 + ¥金额；缺模型时不能漏出 undefined，也不能丢掉金额。
+          if (!want.money.test(textOf(line[1])) || /undefined/.test(textOf(line[1]))) {
+            bad.push(want.name + '：第一行右格应是「模型名 ¥金额」，得到 ' + JSON.stringify(textOf(line[1])))
+          }
           const io = cellsOf(line[2]).map(textOf)
           if (JSON.stringify(io) !== JSON.stringify(want.io)) bad.push(want.name + '：第二行左格应并排 ' + JSON.stringify(want.io) + '，得到 ' + JSON.stringify(io))
           const cache = textOf(line[3])
@@ -771,7 +774,10 @@ console.log('\n  --- 客户端半：座位与配置页注册 ---')
           }
         })
         if (bad.length > 0) leaks.push('单条调用卡版式不对：' + bad.join('；'))
-        else console.log('    ✓ 恰好两行两格：第一行「时间 - 令牌名 | ¥金额」，第二行「input | output | 缓存」，三笔都对')
+        else {
+          const first = cellsOf(grids[0])
+          console.log('    ✓ 恰好两行两格：第一行「' + textOf(first[0]) + ' | ' + textOf(first[1]) + '」，第二行「' + cellsOf(first[2]).map(textOf).join(' ') + ' | ' + textOf(first[3]) + '」；三笔（含缺模型）都对')
+        }
       }
       // 页脚（网关地址 · 读取时间）归左列列底，不跟右列。
       const colL = collect(tree, 'gww_colL')
@@ -791,6 +797,8 @@ console.log('\n  --- 客户端半：座位与配置页注册 ---')
         leaks.push('两行网格没有声明 minmax(0,1fr) / auto 两列（左格居左可省略、右格居右）')
       } else if (!source.includes('.gww_callIO{display:grid;grid-template-columns:minmax(0,16ch) auto')) {
         leaks.push('input / output 的列宽不固定，output: 无法跨行对齐（应 grid + minmax(0,16ch) auto）')
+      } else if (!source.includes('.gww_callModel{color:var(--dsw-alias-label-caption)')) {
+        leaks.push('模型名没有比金额暗一档（.gww_callModel 缺 color 声明）')
       } else if (!source.includes('.gww_tokCache[data-level="ok"]') || !source.includes('.gww_tokCache[data-level="bad"]')) {
         leaks.push('缓存格没有按 ok / bad 档位配色')
       } else {

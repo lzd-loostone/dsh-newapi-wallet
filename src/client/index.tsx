@@ -171,6 +171,8 @@ const CSS = [
   // 于是每张卡片的 output: 都从同一个 x 开始，跨行对齐。窄了先收列宽，不换行、不重叠。
   '.gww_callIO{display:grid;grid-template-columns:minmax(0,16ch) auto;gap:0 10px}',
   '.gww_callAmount{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;font-weight:500;text-align:right;white-space:nowrap}',
+  // 金额左侧的模型名：比金额暗一档，钱是这张卡唯一的高亮。
+  '.gww_callModel{color:var(--dsw-alias-label-caption);margin-right:8px}',
   // 命中率配色：≥96% 绿 / 80~96% 黄 / <80% 红。黄档没有对应 alias，用主题的静态 amber。
   '.gww_tokCache{text-align:right;white-space:nowrap}',
   '.gww_tokCache[data-level="ok"]{color:var(--dsw-alias-state-success-primary)}',
@@ -593,7 +595,10 @@ function CallRows({ calls }: { calls: CallRecord[] }) {
                 {clockLabel(call.createdAt)}
                 {call.tokenName !== undefined ? ` - ${call.tokenName}` : ''}
               </span>
-              <span className="gww_callAmount">{fmtMoney(call.amount)}</span>
+              <span className="gww_callAmount">
+                {call.model !== undefined && <span className="gww_callModel">{call.model}{' '}</span>}
+                {fmtMoney(call.amount)}
+              </span>
               <span className="gww_callCell gww_callIO">
                 <span>input: {usage ? fmtTokens(call.promptTokens ?? 0) : '—'}</span>
                 <span>output: {usage ? fmtTokens(call.completionTokens ?? 0) : '—'}</span>
