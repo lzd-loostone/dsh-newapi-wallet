@@ -38,6 +38,11 @@ const LOGGER_KEY = 'loostone-newapi-wallet'
 const PACKAGE_NAME = '@loostone/dsh-newapi-wallet'
 const DEFAULT_REFRESH_MS = 45_000
 const STYLE_ID = 'loostone-newapi-wallet/panel.css'
+/**
+ * 面板宽度。place() 用「面板宽 + 24」把左边缘夹在窗口里，所以宽度只能有这一个来源：
+ * 面板加宽而收边常量没跟，窄窗口下面板会顶出右边缘。
+ */
+const PANEL_WIDTH = 720
 
 /**
  * 配置页的两半：状态面与写入面。**两者都不是宿主经槽投递的**——
@@ -99,8 +104,8 @@ const CSS = [
   '.gww_layer.gww_rail .gww_badgeIcon{position:static}',
   '.gww_layer.gww_rail .gww_dot{top:1px;right:1px}',
   '.gww_layer.gww_rail .gww_badgeLabel,.gww_layer.gww_rail .gww_badgeValue{display:none}',
-  // 面板：680 宽、78vh 高，整体不滚动，滚动交给两列内部
-  '.gww_panel{z-index:30;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l1);background-color:Canvas;background-image:linear-gradient(rgb(from var(--dsw-alias-bg-overlay,var(--dsw-alias-bg-base)) r g b / 1),rgb(from var(--dsw-alias-bg-overlay,var(--dsw-alias-bg-base)) r g b / 1));width:680px;max-width:calc(100vw - 24px);height:78vh;box-shadow:var(--dsw-shadow-lv2);border-radius:14px;flex-direction:column;display:flex;position:fixed;overflow:hidden;backdrop-filter:none;-webkit-backdrop-filter:none}',
+  // 面板：PANEL_WIDTH 宽、78vh 高，整体不滚动，滚动交给两列内部
+  `.gww_panel{z-index:30;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l1);background-color:Canvas;background-image:linear-gradient(rgb(from var(--dsw-alias-bg-overlay,var(--dsw-alias-bg-base)) r g b / 1),rgb(from var(--dsw-alias-bg-overlay,var(--dsw-alias-bg-base)) r g b / 1));width:${PANEL_WIDTH}px;max-width:calc(100vw - 24px);height:78vh;box-shadow:var(--dsw-shadow-lv2);border-radius:14px;flex-direction:column;display:flex;position:fixed;overflow:hidden;backdrop-filter:none;-webkit-backdrop-filter:none}`,
   '.gww_header{box-sizing:border-box;border-bottom:1px solid var(--dsw-alias-border-l1);flex:none;justify-content:space-between;align-items:center;min-height:46px;padding:10px 14px;display:flex;gap:8px}',
   '.gww_title{color:var(--dsw-alias-label-primary);font-size:13px;font-weight:600;line-height:20px;white-space:nowrap}',
   '.gww_headerActions{align-items:center;gap:2px;display:flex;flex:none}',
@@ -110,8 +115,10 @@ const CSS = [
   '.gww_body{flex:1;min-height:0;display:flex;flex-direction:column}',
   '.gww_content[data-loading]{opacity:.5}',
   '.gww_badgeValue[data-wait]{opacity:.55}',
-  // 两列：左列稍窄（数字+热力图），右列稍宽（四桶+明细要放长文本）
-  '.gww_cols{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,272px) minmax(0,1fr);gap:0}',
+  // 两列：左列 320 放三张金额卡（单卡文字宽 =（320 − 列内边距 28 − 两处间隙 12）/ 3 − 卡片内边距 18 ≈ 75px），
+  // 右列剩下的 400 装四桶与明细。320 是「¥1,234.56」在偏宽中文字体（雅黑 15px 粗体 73.3px）下不省略的下限；
+  // 更长的金额（¥12,345.67 起）仍会被省略号截断，那时改成一列竖排三卡，不要再加宽左列。
+  '.gww_cols{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,320px) minmax(0,1fr);gap:0}',
   '.gww_colL{min-width:0;min-height:0;display:flex;flex-direction:column;padding:14px;overflow-y:auto;scrollbar-width:thin;border-right:1px solid var(--dsw-alias-border-l1)}',
   '.gww_colL::-webkit-scrollbar{width:7px}',
   '.gww_colL::-webkit-scrollbar-thumb{background:var(--dsw-alias-border-l2);border-radius:4px}',
@@ -134,7 +141,7 @@ const CSS = [
   '.gww_ok{color:var(--dsw-alias-state-success-primary)}',
   '.gww_retry{color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;margin-top:8px;padding:3px 10px;font:inherit;font-size:12px}',
   '.gww_retry:hover{background:var(--dsw-alias-interactive-bg-hover)}',
-  // 金额三卡：竖向排列更省宽度，数字更醒目
+  // 金额三卡：三列等宽横排（竖排会把左列顶部推高约 100px）。等宽卡里数字必须放得下，见 .gww_cols 的列宽说明。
   '.gww_stats{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}',
   '.gww_stat{border:1px solid var(--dsw-alias-border-l1);border-radius:9px;padding:8px 9px;min-width:0;background:var(--dsw-alias-bg-layer-3)}',
   '.gww_statValue{color:var(--dsw-alias-label-primary);font-size:15px;line-height:21px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
@@ -981,8 +988,8 @@ function WalletSeat({ wide, useSessions }: SeatProps) {
       if (rect === undefined) return
       setAnchor({
         left: wide === false
-          ? Math.min(rect.right + 8, Math.max(12, window.innerWidth - 704))
-          : Math.min(rect.left, Math.max(12, window.innerWidth - 704)),
+          ? Math.min(rect.right + 8, Math.max(12, window.innerWidth - (PANEL_WIDTH + 24)))
+          : Math.min(rect.left, Math.max(12, window.innerWidth - (PANEL_WIDTH + 24))),
         bottom: window.innerHeight - rect.top + 8,
       })
     }
