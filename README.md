@@ -35,9 +35,15 @@
 - **筛出空集是合法结果，如实显示成全 0**：模型 × 令牌可以一条调用都没有（例如某模型从没用过某个令牌）。
   这时右列「请求 0 / 四桶 0 / 合计 0 · ¥0.00」，左列两个列表照旧全天——不能拿全天数字凑，
   也不能因为「没数据」就把列表藏掉（那会让人以为筛选把界面弄坏了）
-- **令牌在「插件」页里配**：侧栏「插件」→ 本插件 → 访问令牌，一个输入框。写入走 DSH 官方 config form（`settings.update`），保存后即时生效、不用重启；令牌是 `role('secret')` 字段，由宿主脱敏，**只写不读、永不回传浏览器**
+- **多账号**：一个人有多个 New API 账号（模型供应商来自其中几个）时，一行填「名字 + 访问令牌」，最多 8 个。
+  - 余额 / 今日实扣 / 累计已用 / 热力图：各账号**相加**成合计；余额卡悬停弹出**分账号明细**（不改布局，气泡绝对定位），哪个账号快空了在这里一眼看到
+  - **今日按模型**：同名模型跨账号合并成一行，不区分账号
+  - **今日按令牌**：按账号分开，行名「账号1 · 公司 win new」；右侧筛选规则不变（点行筛右列，再点取消）
+  - 某个账号取数失败不影响别的账号：合计照算，失败的那个在悬停卡里写明原因；全部失败才整体报错
+- **低余额红点按账号判断**：任一账号余额低于阈值就亮，阈值在配置页可改（默认 ¥5）。合计很高但某个账号见底，同样值得提醒
+- **令牌在「插件」页里配**：侧栏「插件」→ 本插件 → 一行一个账号，名字 + 访问令牌，加号加行、逐行保存/删除。写入走 DSH 官方 config form（`settings.update`），保存后即时生效、不用重启；令牌是 `role('secret')字段`，由宿主脱敏，**只写不读、永不回传浏览器**
 - **面板里没有任何配置入口**：0.2.2 删掉了供应商卡片与令牌弹窗。面板只剩展示，少一条能写凭据的入口就少一份攻击面
-- 令牌是**全站唯一**的：一个 DSH 通常只连一个 New API 网关，原先「按 DSH 路由分别覆盖令牌」的 `routeAccessTokens` 永不命中，已删除
+- **旧版单令牌自动迁移**：以前填的那一个 `accessToken` 会当成「默认账号」继续生效；想改成多账号，在配置页加一行、填同一个令牌、起个名字即可
 - 按需刷新：只在有会话运行、或面板打开时轮询；空闲且关闭时不发任何请求
 - 站点没返回的字段就不显示对应行，并说明原因，不会静默换算成 0
 
@@ -67,22 +73,22 @@
 
 ```sh
 # GitHub（推荐）：pnpm 会规范化为 hosted 规格，直接下载匿名 HTTPS tarball 并按 commit SHA 锁定
-dsh plugin --profile web add "github:lzd-loostone/dsh-newapi-wallet#v0.2.5"
+dsh plugin --profile web add "github:lzd-loostone/dsh-newapi-wallet#v0.3.0"
 
 # 等价的显式 HTTPS git 地址（效果同上，锁文件里仍会记成 hosted 规格）
-dsh plugin --profile web add "https://github.com/lzd-loostone/dsh-newapi-wallet.git#v0.2.5"
+dsh plugin --profile web add "https://github.com/lzd-loostone/dsh-newapi-wallet.git#v0.3.0"
 
 # 也可以直接给归档 tarball 地址
-dsh plugin --profile web add "https://codeload.github.com/lzd-loostone/dsh-newapi-wallet/tar.gz/refs/tags/v0.2.5"
+dsh plugin --profile web add "https://codeload.github.com/lzd-loostone/dsh-newapi-wallet/tar.gz/refs/tags/v0.3.0"
 
 # 或从内部 npm registry
-dsh plugin --profile web add @loostone/dsh-newapi-wallet@0.2.5
+dsh plugin --profile web add @loostone/dsh-newapi-wallet@0.3.0
 
 # 或分发本地 tarball 文件
-dsh plugin --profile web add <路径>\loostone-dsh-newapi-wallet-0.2.5.tgz
+dsh plugin --profile web add <路径>\loostone-dsh-newapi-wallet-0.3.0.tgz
 ```
 
-- **请钉 tag 或 commit**（`#v0.2.5`），不要写 `#main`/`#master`：pnpm 会把 tag 解析成具体 commit 并把 `codeload` 的 SHA 地址写进 `pnpm-lock.yaml`，同事之间装到的字节完全一致。
+- **请钉 tag 或 commit**（`#v0.3.0`），不要写 `#main`/`#master`：pnpm 会把 tag 解析成具体 commit 并把 `codeload` 的 SHA 地址写进 `pnpm-lock.yaml`，同事之间装到的字节完全一致。
 - 预构建产物 `lib/` 已入库，所以**安装不触发任何构建脚本**，也不会被 pnpm 的构建脚本策略拦截。
 - 零运行时依赖。
 - 用本地 `.tgz` 安装时注意：pnpm 会把它记成 `file:` 依赖，**装完那个文件不能删也不能挪**，否则以后每次 `dsh plugin` / `pnpm install` 都会因解析不到路径而失败。上面的 URL 方式无此约束。
@@ -98,7 +104,15 @@ dsh plugin --profile web remove @loostone/dsh-newapi-wallet
 
 ## 配置
 
-**在哪里填**：侧栏 **「插件」** → 找到本插件 → 打开它，页面上有一个「访问令牌」输入框和一个「保存」按钮。
+**在哪里填**：侧栏 **「插件」** → 找到本插件 → 打开它。页面上是一行一个账号：
+
+| 列 | 说明 |
+| --- | --- |
+| 名字 | 显示名，面板里用它区分令牌（如「公司」「个人」）。留空回退「账号N」 |
+| 访问令牌 | 该账号的 New API 访问令牌。**已有行留空 = 不改**；新账号必填 |
+| 保存 / 删 | 逐行保存，或整行删除 |
+
+点「＋ 添加账号」加一行，最多 8 个。下面还有「余额提醒阈值」（元）——任一账号低于它就点亮侧栏红点。
 
 令牌取自 New API 网页端 **个人设置 → 访问令牌** 生成的那一串（**不是** `sk-` 开头的模型调用密钥）。
 
@@ -108,15 +122,25 @@ dsh plugin --profile web remove @loostone/dsh-newapi-wallet
 - id: loostone-newapi-wallet
   name: '@loostone/dsh-newapi-wallet'
   config:
-    accessToken: '<New API 访问令牌>'
-    refreshMs: 60000        # 可选：自动刷新间隔，实际夹在 [10s, 10min]
+    accounts:
+      a1:                   # 键是稳定 id（前端生成），改名不会换键
+        name: 公司
+        token: '<账号1 的 New API 访问令牌>'
+      a2:
+        name: 个人
+        token: '<账号2 的 New API 访问令牌>'
+    lowBalanceCny: 5        # 可选：任一账号余额低于它即亮红点（默认 5）
+    refreshMs: 60000        # 可选：自动刷新间隔，实际夹在 [10s, 10min]；多账号时下限 30s
+    # 旧版单令牌字段：accounts 为空时仍生效，自动当「默认账号」
+    # accessToken: '<旧令牌>'
 ```
 
 **安全约定**：
 
-- `accessToken` 声明为 `role('secret')`，宿主在把配置下发给浏览器前会**摘掉它的值**，只保留「是否已配置」这个事实。所以输入框**只写不读**，保存后不会回显，这是设计而不是缺陷。
+- `accounts` 里每个 `token` 都声明为 `role('secret')`，宿主在把配置下发给浏览器前会**逐个摘掉它的值**（名字与键保留）。所以配置页能列出已有账号、能改名、能删，但输入框**只写不读**，保存后不会回显——这是设计而不是缺陷。
 - 令牌以**明文**存在上面那个 yml 里，请按密码对待：不要提交到仓库、不要贴进聊天或工单。
 - 未配置令牌时面板会提示「还没配 New API 访问令牌」并告诉你去哪里填，而不是显示 0 假装正常。
+- 令牌只以**指纹**（sha256 前 8 位）出现在账本缓存键与日志里，明文不进缓存键、不进日志、不进浏览器。
 
 网关地址与模型调用密钥仍来自 DSH 原有的 LLM 路由配置，本插件不复制一份、也不写回。
 
@@ -158,6 +182,10 @@ token 桶同源：`prompt_tokens` 里可能同时含缓存命中与缓存写入�
 ```sh
 npm i --no-save --prefix .build-deps esbuild
 node scripts/build.mjs        # 生成 lib/index.js 与 lib/client.js(+map)
+# 离线单测（不需要网关）：账号解析、合并口径、缓存键、配置 schema、红点规则
+npm run build && npm run test:unit
+
+# 全链路（需要真实网关与令牌）
 DSH_TEST_TOKEN=<访问令牌> DSH_TEST_ORIGIN=<网关地址> node test/harness.mjs
 ```
 

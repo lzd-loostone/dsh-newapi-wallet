@@ -127,8 +127,17 @@ interface DayCache {
 
 const caches = new Map<string, DayCache>()
 
-function cacheKey(origin: string, day: string): string {
-  return origin + '|' + day
+/**
+ * 缓存键 = origin + 账号指纹 + 本地日期。账号指纹必须进键：
+ * 同一网关下三个账号的账本互不相干，共用键会让账号 2 的「今日」显示账号 1 的数字。
+ */
+function cacheKey(origin: string, accountKey: string, day: string): string {
+  return origin + '|' + accountKey + '|' + day
+}
+
+/** 单测用的缓存键构造（纯函数，不碰缓存）。 */
+export function cacheKeyForTest(origin: string, accountKey: string, day: string): string {
+  return cacheKey(origin, accountKey, day)
 }
 
 /** 本地日期 YYYY-MM-DD。 */
@@ -318,14 +327,14 @@ async function fetchPages(
  * 取到今日账本（必要时冷启动），返回缓存条目。失败时返回 undefined。
  * 第二次之后只做增量：请求 created_at >= 上次最新，空闲时只有 1 行。
  */
-async function loadDay(origin: string, accessKey: string): Promise<DayCache | undefined> {
+async function loadDay(origin: string, accountKey: string, accessKey: string): Promise<DayCache | undefined> {
   const now = Date.now()
   const day = localDay(now)
   // 只保留今天的缓存：跨零点自然重建（用户确认的失效策略）。
   for (const [key, entry] of caches) {
     if (entry.day !== day) caches.delete(key)
   }
-  const key = cacheKey(origin, day)
+  const key = cacheKey(origin, accountKey, day)
   let cache = caches.get(key)
   if (cache === undefined) {
     cache = { day, origin, rows: new Map(), newest: 0, truncated: false, primed: false }
@@ -473,10 +482,11 @@ export function aggregate(cache: DayCache, filter: LedgerFilter = {}): LedgerTot
 /** 取今日账本并聚合。取数完全失败时返回 undefined（调用方按缺数据显示）。 */
 export async function readLedger(
   origin: string,
+  accountKey: string,
   accessKey: string,
   filter: LedgerFilter = {},
 ): Promise<LedgerTotals | undefined> {
-  const cache = await loadDay(origin, accessKey)
+  const cache = await loadDay(origin, accountKey, accessKey)
   if (cache === undefined || !cache.primed) return undefined
   return aggregate(cache, filter)
 }

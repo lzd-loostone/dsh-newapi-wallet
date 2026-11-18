@@ -71,8 +71,10 @@ export interface UsageAmounts {
  * 列表自己就塌成 1 行，用户再也点不回别的分组。
  */
 export interface TodayGroupRow {
-  /** 分组名：模型名，或令牌名。 */
+  /** 分组名：模型名，或令牌名（多账号时是「账号1 - 令牌名」）。 */
   name: string
+  /** 多账号时该行属于哪个账号；单账号不填。 */
+  account?: string
   /** 该组今日实扣 quota 点数。 */
   quota: number
   /** 该组今日调用次数。 */
@@ -101,6 +103,18 @@ export interface CallRecord {
   requestId?: string
   group?: string
   tokenName?: string
+  /** 多账号时该笔属于哪个账号；单账号不填。 */
+  account?: string
+}
+
+/** 一个账号的余额分项（悬浮余额卡时展示）。失败的账号只有 name + error。 */
+export interface AccountBalance {
+  name: string
+  remaining?: Money
+  today?: Money
+  used?: Money
+  /** 该账号取数失败时的错误码。 */
+  error?: string
 }
 
 export interface WalletSnapshot {
@@ -137,7 +151,11 @@ export interface WalletSnapshot {
   /** 今日账本总行数（服务端当日总行数），截断时可对比出漏了多少。 */
   todayLedgerRows?: number
   /** 当前生效的筛选。缺省 = 未筛选。 */
-  filter?: { model?: string; token?: string }
+  filter?: { model?: string; token?: string; account?: string }
+  /** 多账号时：每个账号的余额分项（按配置顺序）。单账号也给出，长度 1。 */
+  accounts?: AccountBalance[]
+  /** 取数失败的账号（不影响其它账号的合并结果）。 */
+  accountFailures?: Array<{ name: string; error: string }>
   totalTokens?: TokenBuckets
   /** 今日按模型（**全天口径**，不随 filter 收窄）。 */
   todayModels?: TodayGroupRow[]
@@ -179,6 +197,8 @@ export interface WalletBundle {
   selected: string
   /** 毫秒；由宿从设置 newapi-wallet.refreshMs 解析并夹到 [10s,10min] 后下发。 */
   refreshMs?: number
+  /** 余额偏低阈值（人民币），由宿从配置读取后下发；缺省 5。 */
+  lowBalanceCny?: number
   wallet: WalletSnapshot | WalletError
 }
 

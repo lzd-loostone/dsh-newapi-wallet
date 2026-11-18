@@ -17,6 +17,14 @@ import Schema from '@deepseek-ai/schemastery'
 import { registerWalletRoute } from './http.ts'
 import { setAccessConfigSource } from './snapshot.ts'
 
+// 账号解析与指纹：纯函数，导出给离线单测（test/unit.mjs）。
+export { accountKeyForToken, parseAccounts } from './accounts.ts'
+export type { WalletAccount } from './accounts.ts'
+export { resolveLowBalanceCny, setAccessConfigSource } from './snapshot.ts'
+export { mergeMoney, mergeSnapshots } from './merge.ts'
+export type { AccountPart } from './merge.ts'
+export { cacheKeyForTest } from './ledger.ts'
+
 export const name = 'loostone-newapi-wallet'
 
 const LOGGER_KEY = 'loostone-newapi-wallet'
@@ -28,16 +36,29 @@ const LOGGER_KEY = 'loostone-newapi-wallet'
  * 注意：schemastery 会把未知键透传，读取方只取这两个字段，绝不整体展开。
  */
 export const Config = Schema.object({
-  /** New API 访问令牌（用户中心 → 生成的访问令牌，非 sk- 模型密钥）。 */
+  /**
+   * 多账号：稳定键 → { 名字, 令牌 }。键（如 a1）是写入路径与账本缓存键的一部分，
+   * 名字是用户随时可改的显示名——改名只写 name 子路径，令牌不动。
+   * 令牌标 secret，宿主的 redactSecrets 按路径逐个摘掉，浏览器只能看到键与名字。
+   */
+  accounts: Schema.dict(Schema.object({
+    name: Schema.string().default(''),
+    token: Schema.string().role('secret').default(''),
+  })).default({}).volatile(),
+  /** 旧版单令牌。保留一版用于迁移：accounts 为空时视为「默认账号」。 */
   accessToken: Schema.string().role('secret').default('').volatile(),
+  /** 余额偏低阈值（人民币）。任一账号低于它，侧栏红点亮。 */
+  lowBalanceCny: Schema.number().default(5).min(0).volatile(),
   /** 浏览器轮询间隔（毫秒）。 */
   refreshMs: Schema.natural().default(60_000).volatile(),
 })
 
 /** apply() 收到的 config：volatile 字段是 Volatile 引用，离线 harness 里是普通值。 */
 type AccessConfigInput = {
+  accounts?: unknown
   accessToken?: unknown
   refreshMs?: unknown
+  lowBalanceCny?: unknown
 }
 
 /** volatile 字段读快照要 .get()；普通值原样返回。 */
@@ -54,11 +75,15 @@ function unwrapVolatile(value: unknown): unknown {
 function wireAccessConfig(config: AccessConfigInput): void {
   setAccessConfigSource({
     get: () => {
+      const accounts = unwrapVolatile(config.accounts)
       const accessToken = unwrapVolatile(config.accessToken)
       const refreshMs = unwrapVolatile(config.refreshMs)
+      const lowBalanceCny = unwrapVolatile(config.lowBalanceCny)
       return {
+        ...(accounts !== undefined && accounts !== null && typeof accounts === 'object' ? { accounts } : {}),
         ...(typeof accessToken === 'string' ? { accessToken } : {}),
         ...(typeof refreshMs === 'number' && Number.isFinite(refreshMs) ? { refreshMs } : {}),
+        ...(typeof lowBalanceCny === 'number' && Number.isFinite(lowBalanceCny) ? { lowBalanceCny } : {}),
       }
     },
   })

@@ -23,6 +23,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { fingerprintOrigin } from './fingerprint.ts'
 import { readLedger, aggregate } from './ledger.ts'
+import { accountKeyForToken, parseAccounts } from './accounts.ts'
+import type { WalletAccount } from './accounts.ts'
+import { mergeSnapshots } from './merge.ts'
+import type { AccountPart } from './merge.ts'
 import type { LedgerFilter, LedgerTotals } from './ledger.ts'
 import type {
   AccountListItem,
@@ -300,9 +304,9 @@ async function resolveApiKey(ctx: Context, reference: string | undefined): Promi
   }
 }
 
-/** 访问令牌配置（从入口模块注入，避免 snapshot → index 模块环）。0.2.2 起全站唯一。 */
+/** 访问令牌配置（从入口模块注入，避免 snapshot → index 模块环）。0.3.0 起多账号。 */
 export interface AccessConfigSource {
-  get(): { accessToken?: string; refreshMs?: number } | undefined
+  get(): { accounts?: unknown; accessToken?: string; refreshMs?: number; lowBalanceCny?: number } | undefined
 }
 
 let accessConfigSource: AccessConfigSource | undefined
@@ -313,12 +317,22 @@ export function setAccessConfigSource(source: AccessConfigSource | undefined): v
 }
 
 /**
- * 查账凭据（New API 访问令牌）。只认 accessToken 一个来源 ——
+ * 查账凭据（New API 访问令牌）。只认本插件配置里的 accounts / 旧 accessToken ——
  * sk- 模型密钥是 LLM 路由的凭据，永远不参与查账。
  */
-function accessKey(): string | undefined {
-  const token = accessConfigSource?.get()?.accessToken
-  return typeof token === 'string' && token.trim() !== '' ? token.trim() : undefined
+function accountTokens(): WalletAccount[] {
+  return parseAccounts(accessConfigSource?.get())
+}
+
+/**
+ * 把合并后的筛选令牌名翻译回某个账号自己的令牌名。
+ * 客户端点「账号1 - token-a」时传的是合并名；账号 2 的账本里不该出现这个名字，
+ * 所以去掉前缀后照常本地筛选（自然 0 行），不会误命中账号 2 的同名令牌。
+ */
+function tokenNameForAccount(filterToken: string | undefined, accountName: string): string | undefined {
+  if (filterToken === undefined || filterToken === '') return undefined
+  const prefix = accountName + ' - '
+  return filterToken.startsWith(prefix) ? filterToken.slice(prefix.length) : filterToken
 }
 
 export async function listAccounts(ctx: Context): Promise<AccountListItem[]> {
@@ -328,7 +342,7 @@ export async function listAccounts(ctx: Context): Promise<AccountListItem[]> {
   for (const account of detected) {
     const apiKey = await resolveApiKey(ctx, account.apiKeyEnv)
     const hasCredential = apiKey !== undefined && apiKey !== ''
-    const hasAccessKey = accessKey() !== undefined
+    const hasAccessKey = accountTokens().length > 0
     out.push({
       route: account.route,
       displayName: account.displayName,
@@ -575,7 +589,7 @@ async function readNewApi(
 
   // 全天账单：本地缓存 + 增量追加 + 本地筛选（详见 ledger.ts）。
   // 筛选只作用于右侧「今日用量」与「最近调用」；头部实扣与热力图恒为全天口径（用户拍板）。
-  const ledger = await readLedger(account.origin, accessKey, filter)
+  const ledger = await readLedger(account.origin, accountKeyForToken(accessKey), accessKey, filter)
   // 逐条明细要带金额：客户端对 undefined 一律渲染「—」，整个金额列就空白了。
   // 账本缓存只存 quota 点数（单位换算依赖站点 /api/status，属于本层），所以在这里换成 Money。
   const recentCalls: CallRecord[] | undefined = ledger !== undefined && ledger.calls.length > 0
@@ -711,17 +725,35 @@ export async function fetchWallet(
   if ('ok' in account && account.ok === false) return account
 
   // 查账凭据：只认 New API 访问令牌。sk- 模型密钥绝不发往用户级路由。
-  const token = accessKey()
-  if (token === undefined) {
+  const tokens = accountTokens()
+  if (tokens.length === 0) {
     return { ok: false, error: 'no-access-token', detail: account.route }
   }
 
-  try {
-    return await readNewApi(account, token, filter)
-  } catch (error) {
-    const name = error instanceof Error && error.name === 'AbortError' ? 'timeout' : 'unreachable'
-    return { ok: false, error: name, detail: account.origin }
+  // 逐账号顺序取数，不并行：每个账号冷启动最多 200 页 × 12 并发，
+  // 三个账号同时开就是 36 并发，容易把自建网关打出 429。冷启动只在每天首次刷新发生。
+  const parts: AccountPart[] = []
+  for (const tokenAccount of tokens) {
+    const scoped = filter.token !== undefined
+      ? { ...filter, token: tokenNameForAccount(filter.token, tokenAccount.name) }
+      : filter
+    try {
+      parts.push({ name: tokenAccount.name, snapshot: await readNewApi(account, tokenAccount.token, scoped) })
+    } catch (error) {
+      const name = error instanceof Error && error.name === 'AbortError' ? 'timeout' : 'unreachable'
+      parts.push({ name: tokenAccount.name, snapshot: { ok: false, error: name, detail: account.origin } })
+    }
   }
+
+  const merged = mergeSnapshots(parts, resolveLowBalanceCny())
+  if (merged.ok !== true) return merged
+  // 回显筛选：客户端据此高亮当前行（多账号时 token 是合并名）。
+  merged.filter = {
+    ...filter.model !== undefined ? { model: filter.model } : {},
+    ...filter.token !== undefined ? { token: filter.token } : {},
+    ...filter.account !== undefined ? { account: filter.account } : {},
+  }
+  return merged
 }
 
 /**
@@ -735,6 +767,16 @@ export function resolveRefreshMs(): number {
   return Math.min(600_000, Math.max(10_000, Math.round(raw)))
 }
 
+/**
+ * 余额偏低阈值（人民币）。缺省 5 元；负数夹到 0，上限 1,000,000 免得误填一串 0 把红点永久点亮。
+ * 由宿主解析后随 bundle 下发——客户端不自己读配置。
+ */
+export function resolveLowBalanceCny(): number {
+  const raw = accessConfigSource?.get()?.lowBalanceCny
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return 5
+  return Math.min(1_000_000, Math.max(0, raw))
+}
+
 
 export async function fetchBundle(
   ctx: Context,
@@ -745,10 +787,15 @@ export async function fetchBundle(
   const selected = route !== undefined && accounts.some(account => account.route === route)
     ? route
     : accounts.find(account => account.isCurrent)?.route ?? accounts[0]?.route ?? ''
+  // 多账号时每次刷新要打好几倍的网关请求，轮询下限抬到 30s。
+  const refreshMs = accountTokens().length > 1
+    ? Math.max(30_000, resolveRefreshMs())
+    : resolveRefreshMs()
   return {
     accounts,
     selected,
-    refreshMs: resolveRefreshMs(),
+    refreshMs,
+    lowBalanceCny: resolveLowBalanceCny(),
     wallet: await fetchWallet(ctx, selected === '' ? undefined : selected, filter),
   }
 }

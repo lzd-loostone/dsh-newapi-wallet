@@ -7,9 +7,9 @@
  *     且每行可点选：点一下筛右侧，再点同一行取消）；
  *     右列——已筛提示条 → 今日用量四桶 → 最近调用（内部滚动）。
  *     左列只负责「选」，自身永不收窄——否则点一行就再也点不回别的分组。
- *  2. 「插件」页里本插件的配置表单（plugins.bundle.config 槽）：一个访问令牌
- *     输入框 + 一个刷新间隔。令牌写走官方 config form（form.mutate → settings.update），
- *     所以面板里不再需要任何配置入口——供应商卡片与令牌弹窗已在 0.2.2 删除。
+ *  2. 「插件」页里本插件的配置表单（plugins.bundle.config 槽）：多行「名字 + 令牌」，
+ *     加号加行、逐行保存/删除，另加余额提醒阈值。写入走官方 config form
+ *     （form.mutate → settings.update），所以面板里不再需要任何配置入口。
  *
  * 本模块刻意不 import 任何 Harness Client 包（除纯类型）：0.1.7 改过 primitives 的
  * 图标导出名，那次改名让整个座位被 retire。图标与「点外面收起」都自己实现。
@@ -19,6 +19,7 @@ import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {
+  AccountBalance,
   CallRecord,
   DailyPoint,
   Money,
@@ -147,6 +148,14 @@ const CSS = [
   '.gww_statValue{color:var(--dsw-alias-label-primary);font-size:15px;line-height:21px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
   '.gww_statValue[data-low]{color:var(--dsw-alias-state-warn-primary)}',
   '.gww_statLabel{color:var(--dsw-alias-label-caption);font-size:10px;line-height:14px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+  // 余额卡悬浮明细：气泡绝对定位，卡片本身尺寸与布局一点不变（用户要求不加高不加宽）。
+  '.gww_statPeek{position:relative}',
+  '.gww_statHint{color:var(--dsw-alias-label-caption);font-weight:400}',
+  '.gww_peek{position:absolute;top:calc(100% + 4px);left:0;z-index:8;min-width:100%;background:var(--dsw-alias-bg-overlay,Canvas);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;box-shadow:var(--dsw-shadow-lv2);padding:6px 9px;display:flex;flex-direction:column;gap:2px}',
+  '.gww_peekRow{display:flex;justify-content:space-between;gap:12px;font-size:11px;line-height:16px;white-space:nowrap}',
+  '.gww_peekName{color:var(--dsw-alias-label-tertiary);max-width:120px;overflow:hidden;text-overflow:ellipsis}',
+  '.gww_peekValue{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;font-weight:500}',
+  '.gww_peekValue[data-low]{color:var(--dsw-alias-state-warn-primary)}',
   // 分组行（今日按模型 / 今日按令牌）：整行是个按钮，可点选，带占比条
   '.gww_model{display:flex;flex-direction:column;gap:3px;padding:6px;margin:0 -6px;border:0;border-bottom:1px solid var(--dsw-alias-border-l1);border-radius:7px;background:0 0;font:inherit;text-align:left;width:calc(100% + 12px);cursor:pointer}',
   '.gww_model:last-child{border-bottom:0}',
@@ -222,6 +231,12 @@ const CSS = [
   '.gww_cfgHint{color:var(--dsw-alias-label-caption);font-size:11px;line-height:16px;margin:0}',
   '.gww_cfgInput{box-sizing:border-box;width:100%;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-3);border:1px solid var(--dsw-alias-border-l2);border-radius:7px;padding:6px 9px;font:inherit;font-size:12px}',
   '.gww_cfgInput:focus{outline:none;border-color:var(--dsw-alias-label-tertiary)}',
+  // 账号行：名字窄、令牌宽、两个按钮，一行放得下；窄屏时令牌自动换行。
+  '.gww_cfgAccount{display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
+  '.gww_cfgName{flex:0 0 104px;width:104px;min-width:0}',
+  '.gww_cfgNum{flex:0 0 88px;width:88px;text-align:right}',
+  '.gww_cfgAccount .gww_cfgInput:not(.gww_cfgName){flex:1 1 180px;width:auto;min-width:120px}',
+  '.gww_cfgDivider{height:1px;background:var(--dsw-alias-border-l1);margin:2px 0}',
   '.gww_cfgRow{display:flex;align-items:center;gap:8px}',
   '.gww_cfgBtn{cursor:pointer;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover-solid);border:1px solid var(--dsw-alias-border-l2);border-radius:7px;padding:5px 14px;font:inherit;font-size:12px}',
   '.gww_cfgBtn:hover{background:var(--dsw-alias-interactive-bg-hover)}',
@@ -272,15 +287,25 @@ export function fmtTokens(value: number | undefined): string {
   return Number((value / scale).toFixed(3)) + suffix
 }
 
-/** 花费低于提示阈值时才打提示点（阈值见下一行）。 */
+/** 阈值缺省 5 元；真实值由宿从配置解析后随 bundle 下发（低余额提醒）。 */
 const LOW_CNY = 5
 
-function isLowBalance(money: Money | undefined): boolean {
+function isLowBalance(money: Money | undefined, threshold = LOW_CNY): boolean {
   if (money === undefined) return false
   if (typeof money.display === 'number' && Number.isFinite(money.display)) {
-    return money.display < LOW_CNY
+    return money.display < threshold
   }
   return false
+}
+
+/**
+ * 红点口径 A：**任一**账号余额低于阈值就亮。
+ * 合计余额高但某个账号快空了，同样值得提醒——钱是按账号充的。
+ * 没有分账号数据（旧快照/单账号）时退回看合计。
+ */
+export function anyAccountLow(accounts: AccountBalance[] | undefined, threshold = LOW_CNY): boolean {
+  if (accounts === undefined || accounts.length === 0) return false
+  return accounts.some(account => isLowBalance(account.remaining, threshold))
 }
 
 function agoLabel(at: number, now = Date.now()): string {
@@ -408,14 +433,43 @@ function useDismissOnOutsidePointer(
 /* 展示组件                                                             */
 /* ------------------------------------------------------------------ */
 
-/** 金额三卡：余额 / 今日实扣 / 累计已用。数字用 tabular-nums 对齐。 */
-function StatCards({ snapshot }: { snapshot: WalletSnapshot }) {
-  const low = isLowBalance(snapshot.remaining)
+/**
+ * 金额三卡：余额 / 今日实扣 / 累计已用。数字用 tabular-nums 对齐。
+ *
+ * 余额卡在多账号时悬浮出分账号明细（不改布局：气泡绝对定位）。
+ * 合计高但某个账号快空了，是这里最主要的信息。
+ */
+function StatCards({ snapshot, lowBalanceCny }: { snapshot: WalletSnapshot; lowBalanceCny: number }) {
+  const [peek, setPeek] = useState(false)
+  const accounts = snapshot.accounts ?? []
+  const multi = accounts.length > 1
+  const low = isLowBalance(snapshot.remaining, lowBalanceCny) || anyAccountLow(accounts, lowBalanceCny)
   return (
     <div className="gww_stats">
-      <div className="gww_stat">
+      <div
+        className="gww_stat gww_statPeek"
+        onMouseEnter={() => setPeek(true)}
+        onMouseLeave={() => setPeek(false)}
+      >
         <div className="gww_statValue" {...low ? { 'data-low': '' } : {}}>{fmtMoney(snapshot.remaining)}</div>
-        <div className="gww_statLabel">余额</div>
+        <div className="gww_statLabel">
+          余额{multi ? <span className="gww_statHint"> · {accounts.length} 个账号</span> : null}
+        </div>
+        {multi && peek && (
+          <div className="gww_peek" role="tooltip">
+            {accounts.map((account) => (
+              <div key={account.name} className="gww_peekRow">
+                <span className="gww_peekName">{account.name}</span>
+                <span
+                  className="gww_peekValue"
+                  {...isLowBalance(account.remaining, lowBalanceCny) ? { 'data-low': '' } : {}}
+                >
+                  {account.error !== undefined ? walletErrorCopy(account.error) : fmtMoney(account.remaining)}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
       <div className="gww_stat">
         <div className="gww_statValue">{snapshot.todayAvailable ? fmtMoney(snapshot.today) : '—'}</div>
@@ -502,6 +556,7 @@ function GroupList({
             aria-pressed={selected === row.name}
             title={
               (selected === row.name ? '再点一次取消筛选 · ' : '点一下筛右侧 · ')
+              + (row.account !== undefined ? '账号 ' + row.account + ' · ' : '')
               + 'token ' + fmtCount(row.tokens) + ' · 账本额度点 ' + fmtCount(row.quota)
             }
           >
@@ -600,7 +655,10 @@ function CallRows({ calls }: { calls: CallRecord[] }) {
             <div className="gww_callGrid">
               <span className="gww_callCell">
                 {clockLabel(call.createdAt)}
-                {call.tokenName !== undefined ? ` - ${call.tokenName}` : ''}
+                {call.account !== undefined ? ` - ${call.account}` : ''}
+                {call.tokenName !== undefined
+                  ? (call.account !== undefined ? ` · ${call.tokenName}` : ` - ${call.tokenName}`)
+                  : ''}
               </span>
               <span className="gww_callAmount">
                 {call.model !== undefined && <span className="gww_callModel">{call.model}{' '}</span>}
@@ -774,6 +832,7 @@ export function WalletBody({
   loading,
   onRetry,
   onPick,
+  lowBalanceCny = LOW_CNY,
 }: {
   snapshot: WalletSnapshot | undefined
   error: string | undefined
@@ -781,6 +840,7 @@ export function WalletBody({
   loading: 'block' | 'dim' | false
   onRetry: () => void
   onPick: (dim: 'model' | 'token', value: string) => void
+  lowBalanceCny?: number
 }) {
   if (loading === 'block' || (snapshot === undefined && fail === undefined && error === undefined)) {
     return <p className="gww_note">读取中…</p>
@@ -801,7 +861,7 @@ export function WalletBody({
     <div className="gww_cols gww_content" {...loading === 'dim' ? { 'data-loading': '' } : {}}>
       {/* 左列：金额三卡 → 热力图 → 今日按模型 / 今日按令牌（全天口径，行可点选） */}
       <div className="gww_colL">
-        <StatCards snapshot={snapshot} />
+        <StatCards snapshot={snapshot} lowBalanceCny={lowBalanceCny} />
 
         {!snapshot.todayAvailable && snapshot.todayUnavailableReason !== undefined && (
           <p className="gww_note">站点没有开放今日统计。</p>
@@ -1021,7 +1081,10 @@ function WalletSeat({ wide, useSessions }: SeatProps) {
             ...bundle.wallet.detail !== undefined ? { note: bundle.wallet.detail } : {},
           }
         : { title: error }
-  const low = snapshot !== undefined && loading !== 'block' && isLowBalance(snapshot.remaining)
+  // 口径 A：任一账号低于阈值即亮红点（见 anyAccountLow）。
+  const low = snapshot !== undefined && loading !== 'block'
+    && (isLowBalance(snapshot.remaining, bundle?.lowBalanceCny ?? LOW_CNY)
+      || anyAccountLow(snapshot.accounts, bundle?.lowBalanceCny ?? LOW_CNY))
   const reload = (): void => {
     if (busy) return
     setPending('manual')
@@ -1083,6 +1146,7 @@ function WalletSeat({ wide, useSessions }: SeatProps) {
               loading={loading}
               onRetry={reload}
               onPick={pickFilter}
+              lowBalanceCny={bundle?.lowBalanceCny ?? LOW_CNY}
             />
           </div>
         </div>
@@ -1113,10 +1177,31 @@ function missingFormHook(select: (state: ConfigFormState) => ConfigFormState): C
 }
 const identityFormState = (state: ConfigFormState): ConfigFormState => state
 
+/** 一行草稿：已存在的账号（key 来自配置）或新加的一行（fresh，key 由前端生成）。 */
+interface AccountDraft {
+  key: string
+  name: string
+  token: string
+  fresh: boolean
+}
+
+/** 账号上限与宿主 parseAccounts 保持一致。 */
+const ACCOUNT_MAX = 8
+
+/** 新行 key：前端生成、只在本表单内唯一；宿主拿它当 dict 键，之后就是稳定 id。 */
+function newAccountKey(): string {
+  return 'a' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5)
+}
+
 function PluginConfigForm({ useWalletConfigForm, mutate }: ConfigPageProps) {
-  const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<{ tone: 'ok' | 'err'; text: string } | undefined>(undefined)
+  /** 已存在账号的未保存改动（key → 字段）。空对象 = 没动过。 */
+  const [edits, setEdits] = useState<Record<string, { name?: string; token?: string }>>({})
+  /** 还没写进配置的新行。 */
+  const [fresh, setFresh] = useState<AccountDraft[]>([])
+  /** 阈值的未保存输入；undefined = 跟随后端值。 */
+  const [thresholdDraft, setThresholdDraft] = useState<string | undefined>(undefined)
 
   // Hooks 必须无条件先调用，所以缺失时用替身，而不是提前 return。
   const state = (useWalletConfigForm ?? missingFormHook)(identityFormState)
@@ -1125,15 +1210,16 @@ function PluginConfigForm({ useWalletConfigForm, mutate }: ConfigPageProps) {
   }
   if (state.status === 'loading') return <p className="gww_cfgHint">读取中…</p>
 
-  // accessToken 是 role('secret')，宿主会把它从 value / base / user **三层**都摘掉
-  // （dsh-settings 的 redactSecrets），只在一个 `secrets` 侧信道里留下 {path, set}。
-  // 而客户端的 ConfigForm.derive() 只搬运 value/base/user/user，**不搬运 secrets**
-  // （实测 dsh-client-ui-settings/lib/client.js 的 derive() 里没有它）。
-  // 结论：这一层拿不到任何「是否已配置」的信号，所以不要猜——只陈述令牌只写不读，
-  // 把真实状态交给面板：那边读不到令牌会明确说「还没配访问令牌」。
+  // 令牌是 role('secret')，宿主会把它从 value / base / user **三层**都摘掉
+  // （dsh-settings 的 redactSecrets），客户端的 ConfigForm.derive() 又不搬运 secrets
+  // 侧信道。所以：**键和名字看得见，令牌看不见**——已配置的行能列出来、能改名、能删除，
+  // 但输入框只能写。想知道配没配，看面板：读不到令牌它会直接说。
   const writable = state.writable !== false
+  const accounts = (state.value?.accounts ?? {}) as Record<string, { name?: string } | undefined>
+  const keys = Object.keys(accounts)
+  const thresholdShown = thresholdDraft ?? String(state.value?.lowBalanceCny ?? LOW_CNY)
 
-  const run = async (ops: readonly ConfigOp[], okText: string): Promise<void> => {
+  const run = async (ops: readonly ConfigOp[], okText: string): Promise<boolean> => {
     setBusy(true)
     setMsg(undefined)
     try {
@@ -1141,64 +1227,224 @@ function PluginConfigForm({ useWalletConfigForm, mutate }: ConfigPageProps) {
       setMsg(accepted
         ? { tone: 'ok', text: okText }
         : { tone: 'err', text: '宿主拒绝了这次写入。' })
-      if (accepted) setDraft('')
+      return accepted
     } catch (failure) {
       setMsg({ tone: 'err', text: failure instanceof Error ? failure.message : String(failure) })
+      return false
     } finally {
       setBusy(false)
     }
   }
 
-  const save = (): void => {
-    const token = draft.trim()
-    if (token === '') {
-      setMsg({ tone: 'err', text: '先填一个访问令牌；要清除已存的令牌请点「清除」。' })
-      return
-    }
-    void run([{ op: 'set', path: ['accessToken'], value: token }], '已保存。面板下一次刷新就会用上新令牌。')
+  const editOf = (key: string): { name?: string; token?: string } => edits[key] ?? {}
+  const patch = (key: string, field: 'name' | 'token', value: string): void => {
+    setEdits(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }))
+  }
+  const clearEdit = (key: string): void => {
+    setEdits((prev) => {
+      const next = { ...prev }
+      delete next[key]
+      return next
+    })
   }
 
+  /** 保存一行已存在的账号：名字变了才写名字；令牌留空 = 不改。 */
+  const saveRow = async (key: string): Promise<void> => {
+    const edit = editOf(key)
+    const known = typeof accounts[key]?.name === 'string' ? accounts[key]?.name ?? '' : ''
+    const name = edit.name?.trim()
+    const token = edit.token?.trim() ?? ''
+    const ops: ConfigOp[] = []
+    if (name !== undefined && name !== known) ops.push({ op: 'set', path: ['accounts', key, 'name'], value: name })
+    if (token !== '') ops.push({ op: 'set', path: ['accounts', key, 'token'], value: token })
+    if (ops.length === 0) {
+      setMsg({ tone: 'err', text: '这一行没有改动：名字没变，令牌也没填。' })
+      return
+    }
+    if (await run(ops, '已保存。面板下一次刷新就会用上新配置。')) clearEdit(key)
+  }
+
+  /** 保存新行：令牌必填（只写不读，保存后输入框清空）。 */
+  const saveFresh = async (draft: AccountDraft): Promise<void> => {
+    const token = draft.token.trim()
+    if (token === '') {
+      setMsg({ tone: 'err', text: '新账号要先填访问令牌。' })
+      return
+    }
+    const name = draft.name.trim()
+    const accepted = await run(
+      [{ op: 'set', path: ['accounts', draft.key], value: { name, token } }],
+      '已保存。面板下一次刷新就会用上新账号。',
+    )
+    if (accepted) setFresh(prev => prev.filter(row => row.key !== draft.key))
+  }
+
+  const removeRow = async (key: string): Promise<void> => {
+    if (await run([{ op: 'unset', path: ['accounts', key] }], '已删除。')) clearEdit(key)
+  }
+
+  const patchFresh = (key: string, field: 'name' | 'token', value: string): void => {
+    setFresh(prev => prev.map(row => (row.key === key ? { ...row, [field]: value } : row)))
+  }
+
+  const saveThreshold = async (): Promise<void> => {
+    const parsed = Number(thresholdShown)
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      setMsg({ tone: 'err', text: '阈值要填一个不小于 0 的数字（单位：元）。' })
+      return
+    }
+    if (await run([{ op: 'set', path: ['lowBalanceCny'], value: parsed }], '已保存。红点下一次刷新就按新阈值判断。')) {
+      setThresholdDraft(undefined)
+    }
+  }
+
+  const total = keys.length + fresh.length
   return (
     <div className="gww_cfg">
       <div>
-        <label className="gww_cfgLabel" htmlFor="gww_cfg_token">访问令牌</label>
+        <span className="gww_cfgLabel">账号</span>
         <p className="gww_cfgHint">
-          New API 站点「个人设置 → 访问令牌」里生成的那一串，<strong>不是</strong> sk- 开头的模型密钥。
-          令牌<strong>只写不读</strong>——宿主按 <code>role('secret')</code> 脱敏，保存后不会回显，
-          这里也不显示「是否已配置」。想知道配没配，看侧边栏账本面板：没配它会直接说。
+          每个 New API 账号一行：左边起个名字（面板里用它区分令牌），右边填该账号的访问令牌
+          —— 站点「个人设置 → 访问令牌」里生成的那串，<strong>不是</strong> sk- 开头的模型密钥。
+          令牌<strong>只写不读</strong>：保存后不回显，已有行留空即表示「不改」。余额、今日实扣与热力图按账号相加；
+          「今日按令牌」按「账号名 · 令牌名」分开列。
         </p>
       </div>
-      <input
-        id="gww_cfg_token"
-        type="password"
-        className="gww_cfgInput"
-        value={draft}
-        autoComplete="off"
-        disabled={busy || !writable}
-        placeholder="粘贴访问令牌（留空点「清除」可删除已存的）"
-        onChange={event => setDraft(event.target.value)}
-        onKeyDown={event => { if (event.key === 'Enter') save() }}
-      />
+
+      {keys.map((key) => {
+        const edit = editOf(key)
+        const name = edit.name ?? (typeof accounts[key]?.name === 'string' ? accounts[key]?.name ?? '' : '')
+        return (
+          <div key={key} className="gww_cfgAccount">
+            <input
+              className="gww_cfgInput gww_cfgName"
+              value={name}
+              disabled={busy || !writable}
+              placeholder="账号名"
+              aria-label="账号名"
+              onChange={event => patch(key, 'name', event.target.value)}
+            />
+            <input
+              className="gww_cfgInput"
+              type="password"
+              value={edit.token ?? ''}
+              autoComplete="off"
+              disabled={busy || !writable}
+              placeholder="访问令牌（留空不改）"
+              aria-label="访问令牌"
+              onChange={event => patch(key, 'token', event.target.value)}
+              onKeyDown={event => { if (event.key === 'Enter') void saveRow(key) }}
+            />
+            <button
+              type="button"
+              className="gww_cfgBtn"
+              disabled={busy || !writable}
+              onClick={() => { void saveRow(key) }}
+            >
+              保存
+            </button>
+            <button
+              type="button"
+              className="gww_cfgBtn"
+              disabled={busy || !writable}
+              aria-label={'删除账号 ' + (name === '' ? key : name)}
+              onClick={() => { void removeRow(key) }}
+            >
+              删
+            </button>
+          </div>
+        )
+      })}
+
+      {fresh.map((draft) => (
+        <div key={draft.key} className="gww_cfgAccount">
+          <input
+            className="gww_cfgInput gww_cfgName"
+            value={draft.name}
+            disabled={busy || !writable}
+            placeholder="账号名"
+            aria-label="账号名"
+            onChange={event => patchFresh(draft.key, 'name', event.target.value)}
+          />
+          <input
+            className="gww_cfgInput"
+            type="password"
+            value={draft.token}
+            autoComplete="off"
+            disabled={busy || !writable}
+            placeholder="访问令牌"
+            aria-label="访问令牌"
+            onChange={event => patchFresh(draft.key, 'token', event.target.value)}
+            onKeyDown={event => { if (event.key === 'Enter') void saveFresh(draft) }}
+          />
+          <button
+            type="button"
+            className="gww_cfgBtn"
+            disabled={busy || !writable}
+            onClick={() => { void saveFresh(draft) }}
+          >
+            添加
+          </button>
+          <button
+            type="button"
+            className="gww_cfgBtn"
+            disabled={busy}
+            onClick={() => setFresh(prev => prev.filter(row => row.key !== draft.key))}
+          >
+            取消
+          </button>
+        </div>
+      ))}
+
       <div className="gww_cfgRow">
         <button
           type="button"
           className="gww_cfgBtn"
           {...busy ? { 'data-busy': '' } : {}}
-          disabled={busy || !writable}
-          onClick={save}
+          disabled={busy || !writable || total >= ACCOUNT_MAX}
+          onClick={() => setFresh(prev => [...prev, { key: newAccountKey(), name: '', token: '', fresh: true }])}
         >
-          {busy ? '保存中…' : '保存'}
+          ＋ 添加账号
         </button>
+        <span className="gww_cfgHint">
+          {total >= ACCOUNT_MAX ? '最多 ' + ACCOUNT_MAX + ' 个账号。' : '已填 ' + total + ' / ' + ACCOUNT_MAX}
+        </span>
+      </div>
+
+      <div className="gww_cfgDivider" />
+
+      <div>
+        <span className="gww_cfgLabel">余额提醒阈值</span>
+        <p className="gww_cfgHint">任一账号余额低于这个数，左下角「账本」图标上就亮红点。</p>
+      </div>
+      <div className="gww_cfgRow">
+        <input
+          className="gww_cfgInput gww_cfgNum"
+          inputMode="decimal"
+          value={thresholdShown}
+          disabled={busy || !writable}
+          aria-label="余额提醒阈值（元）"
+          onChange={event => setThresholdDraft(event.target.value)}
+          onKeyDown={event => { if (event.key === 'Enter') void saveThreshold() }}
+        />
+        <span className="gww_cfgHint">元</span>
         <button
           type="button"
           className="gww_cfgBtn"
           disabled={busy || !writable}
-          onClick={() => { void run([{ op: 'unset', path: ['accessToken'] }], '已清除。') }}
+          onClick={() => { void saveThreshold() }}
         >
-          清除
+          保存
         </button>
         {!writable && <span className="gww_cfgHint">当前 profile 不接受写入。</span>}
       </div>
+
+      {keys.length === 0 && fresh.length === 0 && (
+        <p className="gww_cfgHint">
+          还没有账号。以前填过的单个令牌会自动当成「默认账号」继续生效；
+          想把它改成多账号，在这里加一行、填同一个令牌、起个名字即可（旧值会被新配置覆盖）。
+        </p>
+      )}
       {msg !== undefined && <p className="gww_cfgMsg" data-tone={msg.tone}>{msg.text}</p>}
     </div>
   )
