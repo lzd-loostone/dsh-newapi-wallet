@@ -5,6 +5,9 @@
  * 只缓存认出的结果：一次网络抖动不该让整段会话都判成「不是 New API」。
  */
 
+import { retryDelayMs, shouldRetryNow, sleep } from './pool.ts'
+import { gatewayLimit } from './limit.ts'
+
 export interface Fingerprint {
   software: 'newapi' | 'unknown'
   /** unknown 时给出人话原因，供界面解释「为什么这条路由没出现在卡片里」。 */
@@ -22,18 +25,27 @@ interface ProbeResult {
   body: Record<string, unknown>
 }
 
-async function probe(origin: string): Promise<ProbeResult> {
+async function probe(origin: string, attempt = 0): Promise<ProbeResult> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), PROBE_MS)
   try {
-    const response = await fetch(new URL(PROBE_PATH, origin), {
+    const response = await gatewayLimit(() => fetch(new URL(PROBE_PATH, origin), {
       headers: { accept: 'application/json' },
       signal: controller.signal,
-    })
+    }))
     const parsed: unknown = await response.json().catch(() => ({}))
     const body = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
       ? parsed as Record<string, unknown>
       : {}
+    // 429 是限流，不是「不是 New API」：退避后重试一次再说。
+    if (response.status === 429) {
+      const retryAfter = Number(response.headers.get('retry-after'))
+      const wait = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined
+      if (shouldRetryNow(attempt, wait, 1)) {
+        await sleep(retryDelayMs(attempt, wait))
+        return probe(origin, attempt + 1)
+      }
+    }
     return { status: response.status, body }
   } catch {
     return { status: 0, body: {} }
@@ -44,6 +56,9 @@ async function probe(origin: string): Promise<ProbeResult> {
 
 function score({ status, body }: ProbeResult): Fingerprint {
   if (status === 0) return { software: 'unknown', reason: `连不上站点（${PROBE_PATH}）` }
+  if (status === 429) {
+    return { software: 'unknown', reason: '站点正在限流（HTTP 429），稍后自动重试' }
+  }
   if (status < 200 || status >= 300) {
     return { software: 'unknown', reason: `站点没有 New API 的 ${PROBE_PATH}（HTTP ${status}）` }
   }

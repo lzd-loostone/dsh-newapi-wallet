@@ -12,6 +12,8 @@
  *     空闲时只回 1 行（约 1KB）。
  *   - 筛选（模型 / 令牌，AND 语义）在本地缓存上重算，切筛选零网关请求。
  *   - 缓存按 (origin, 本地日期) 键控，跨零点自然失效重建；顺手剔除其它日期条目。
+ *   - 0.4.0 起当日行**落盘**（store.ts 的 SQLite）：进程重启/插件重载后直接接着增量，
+ *     不再重翻 200 页；跨零点时顺手 prune 掉 7 天前的行。
  *
  * 实测依据（2026-10-13，公司 New API 网关）：
  *   - 行一旦出现即不再改写（8 次采样 11 行，0 次变动）→ 增量累加安全，无需覆盖更新。
@@ -20,6 +22,10 @@
  *   - /api/log/self 原生支持 model_name / token_name 且为 AND，但我们改在本地筛：
  *     切筛选不发请求，且不会因分页上限而漏掉早上那些行。
  */
+
+import { sharedStore } from './store.ts'
+import { retryDelayMs, shouldRetryNow } from './pool.ts'
+import { gatewayLimit } from './limit.ts'
 
 /** 一行账单的摘要（内存缓存用）。字段名刻意短，因为一天可能存上万条。 */
 export interface LedgerRow {
@@ -248,21 +254,33 @@ interface PageResult {
   total?: number
 }
 
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
 async function fetchPage(
   origin: string,
   accessKey: string,
   params: Record<string, string | number>,
+  attempt = 0,
 ): Promise<PageResult> {
   const url = new URL('/api/log/self', origin)
   for (const [key, value] of Object.entries(params)) url.searchParams.set(key, String(value))
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS)
   try {
-    const response = await fetch(url, {
+    const response = await gatewayLimit(() => fetch(url, {
       headers: { accept: 'application/json', authorization: 'Bearer ' + accessKey },
       signal: controller.signal,
-    })
+    }))
     const body = await response.json().catch(() => ({})) as Record<string, unknown>
+    // 429 是限流不是失败：退避后重试一次（翻页并发 12，重试太多会放大限流）。
+    if (response.status === 429) {
+      const retryAfter = Number(response.headers.get('retry-after'))
+      const wait = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined
+      if (shouldRetryNow(attempt, wait, 1)) {
+        await sleep(retryDelayMs(attempt, wait))
+        return fetchPage(origin, accessKey, params, attempt + 1)
+      }
+    }
     if (response.status < 200 || response.status >= 300) return { ok: false, items: [] }
     if (body.success === false || body.code === false) return { ok: false, items: [] }
     const payload = body.data
@@ -280,15 +298,15 @@ async function fetchPage(
   }
 }
 
-/** 把一批行塞进缓存。返回真正新增的行数。 */
-function absorb(cache: DayCache, items: Record<string, unknown>[]): number {
-  let added = 0
+/** 把一批行塞进缓存。返回真正新增的行（调用方拿去落盘）。 */
+function absorb(cache: DayCache, items: Record<string, unknown>[]): LedgerRow[] {
+  const added: LedgerRow[] = []
   for (const item of items) {
     if (item === null || typeof item !== 'object') continue
     const row = toRow(item)
     if (row === undefined || cache.rows.has(row.id)) continue
     cache.rows.set(row.id, row)
-    added += 1
+    added.push(row)
     const sec = Math.floor(row.t / 1000)
     if (sec > cache.newest) cache.newest = sec
   }
@@ -303,8 +321,10 @@ async function fetchPages(
   from: number,
   to: number,
   pages: number[],
-): Promise<boolean> {
+  sink?: LedgerRow[],
+): Promise<number> {
   let anyOk = false
+  let failed = 0
   const queue = [...pages]
   const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
     while (queue.length > 0) {
@@ -313,14 +333,17 @@ async function fetchPages(
       const result = await fetchPage(origin, accessKey, {
         type: 2, p: page, page_size: PAGE_SIZE, start_timestamp: from, end_timestamp: to,
       })
-      if (!result.ok) continue
+      if (!result.ok) { failed += 1; continue }
       anyOk = true
       if (result.total !== undefined) cache.serverTotal = result.total
-      absorb(cache, result.items)
+      const added = absorb(cache, result.items)
+      if (sink !== undefined) sink.push(...added)
     }
   })
   await Promise.all(workers)
-  return anyOk
+  // 返回失败页数：0 才算「全量扫描完整」。有页失败时调用方保留 primed=false，
+  // 下次刷新重扫一遍（INSERT OR IGNORE 幂等），避免把漏页当成完整数据。
+  return failed
 }
 
 /**
@@ -335,11 +358,24 @@ async function loadDay(origin: string, accountKey: string, accessKey: string): P
     if (entry.day !== day) caches.delete(key)
   }
   const key = cacheKey(origin, accountKey, day)
+  const store = sharedStore()
   let cache = caches.get(key)
   if (cache === undefined) {
     cache = { day, origin, rows: new Map(), newest: 0, truncated: false, primed: false }
+    // 落盘预热：磁盘上已经有今天的数据（进程重启 / 插件重载）时直接接着增量，
+    // 不再重翻最多 200 页。这就是「重启后首个刷新 122 请求 → 25」的关键一步。
+    const stored = store?.getDay(origin, accountKey, day)
+    if (stored !== undefined && stored.rows.length > 0) {
+      for (const row of stored.rows) cache.rows.set(row.id, row)
+      cache.newest = stored.newest
+      if (stored.serverTotal !== undefined) cache.serverTotal = stored.serverTotal
+      cache.truncated = stored.truncated
+      cache.primed = true
+    }
     caches.set(key, cache)
   }
+  /** 本次新吸收的行，函数末尾一次性落盘。 */
+  const addedRows: LedgerRow[] = []
 
   const to = Math.floor(now / 1000)
 
@@ -353,7 +389,7 @@ async function loadDay(origin: string, accountKey: string, accessKey: string): P
     if (first.total !== undefined) cache.serverTotal = first.total
     // 行可能被同秒的新行挤到第二页，所以增量点取「本页最新 − 1 秒」。
     const before = cache.newest
-    absorb(cache, first.items)
+    addedRows.push(...absorb(cache, first.items))
     if (before === 0 && cache.newest > 0) cache.newest = Math.max(cache.newest - 1, dayStartSeconds(now))
 
     const total = cache.serverTotal ?? first.items.length
@@ -363,8 +399,14 @@ async function loadDay(origin: string, accountKey: string, accessKey: string): P
     if (capped > 1) {
       const rest: number[] = []
       for (let page = 2; page <= capped; page++) rest.push(page)
-      await fetchPages(cache, origin, accessKey, dayStartSeconds(now), to, rest)
+      const failedPages = await fetchPages(cache, origin, accessKey, dayStartSeconds(now), to, rest, addedRows)
+      if (failedPages > 0) {
+        // 有页没拉到就当作「还没扫完」：下次刷新重扫，绝不让漏页静默变成精确的合计。
+        cache.primed = false
+        cache.truncated = false
+      }
     }
+    persist(store, origin, accountKey, day, addedRows, cache)
     return cache
   }
 
@@ -380,26 +422,52 @@ async function loadDay(origin: string, accountKey: string, accessKey: string): P
   })
   if (head.ok) {
     if (head.total !== undefined) cache.serverTotal = head.total
-    absorb(cache, head.items)
+    addedRows.push(...absorb(cache, head.items))
     // 同秒新行可能把旧行挤到第二页；增量点回退 1 秒，靠主键去重兜住重复。
     if (cache.rows.size > 0) cache.newest = Math.max(cache.newest - 1, dayFrom)
   }
   if (cache.serverTotal !== undefined) cache.truncated = cache.serverTotal > MAX_PAGES * PAGE_SIZE
 
   if (cache.newest > 0 && to > cache.newest) {
+    const startNewest = cache.newest
     let page = 1
+    let deltaFailed = false
     while (page <= MAX_PAGES) {
       const result = await fetchPage(origin, accessKey, {
         type: 2, p: page, page_size: PAGE_SIZE, start_timestamp: cache.newest, end_timestamp: to,
       })
-      if (!result.ok) break
-      absorb(cache, result.items)
+      if (!result.ok) { deltaFailed = true; break }
+      addedRows.push(...absorb(cache, result.items))
       if (result.items.length < PAGE_SIZE) break
       page += 1
     }
+    // 增量页失败：把增量点退回去，下次刷新重取这段窗口（request_id 去重是幂等的）。
+    if (deltaFailed) cache.newest = startNewest
   }
+  persist(store, origin, accountKey, day, addedRows, cache)
   return cache
 }
+
+/** 把本次新增的行与元信息写回磁盘；顺手按天清理过期数据（每天只做一次）。 */
+function persist(
+  store: ReturnType<typeof sharedStore>,
+  origin: string,
+  accountKey: string,
+  day: string,
+  addedRows: LedgerRow[],
+  cache: DayCache,
+): void {
+  if (store === undefined) return
+  if (addedRows.length > 0 || cache.serverTotal !== undefined) {
+    store.appendRows(origin, accountKey, day, addedRows, cache.newest, cache.serverTotal, cache.truncated)
+  }
+  if (prunedFor !== day) {
+    prunedFor = day
+    store.prune(day)
+  }
+}
+
+let prunedFor: string | undefined
 
 /**
  * 聚合（带筛选）。筛选在本地做：切筛选不发任何网关请求，也不会像分页那样漏掉早上的行。
@@ -490,4 +558,3 @@ export async function readLedger(
   if (cache === undefined || !cache.primed) return undefined
   return aggregate(cache, filter)
 }
-

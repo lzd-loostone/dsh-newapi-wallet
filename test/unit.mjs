@@ -303,12 +303,138 @@ check('anyAccountLow：失败的账号（无余额）不点红点', () => {
   assert.equal(client.anyAccountLow([{ name: '账号1', error: 'unauthorized' }], 5), false)
 })
 
+/* ---------------- Task 7：本地缓存与并发池 ---------------- */
+
+const fs = await import('node:fs')
+const os = await import('node:os')
+
+function withStore(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gww-store-'))
+  const store = bundle.openStore(dir)
+  assert.ok(store, 'store 应可用（Node 22.5+ 自带 node:sqlite）')
+  try {
+    return fn(store)
+  } finally {
+    store.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+const ROW1 = { id: 'r1', t: 1_700_000_000_000, m: 'gpt', k: 'tk', q: 1, i: 1, o: 0, r: 0, w: 0, pi: 10, po: 5, pr: 0, pw: 0 }
+const ROW2 = { id: 'r2', t: 1_700_000_001_000, m: 'gpt', q: 2, i: 2, o: 0, r: 0, w: 0, pi: 20, po: 0, pr: 0, pw: 0 }
+
+check('store：账本行写入后读回，重复 id 不重复', () => withStore((store) => {
+  store.appendRows('o', 'acc', '2026-11-19', [ROW1, ROW2], 1_700_000_002, 2)
+  store.appendRows('o', 'acc', '2026-11-19', [ROW1, ROW2], 1_700_000_002, 2)
+  const day = store.getDay('o', 'acc', '2026-11-19')
+  assert.equal(day.rows.length, 2)
+  assert.equal(day.newest, 1_700_000_002)
+  assert.equal(day.serverTotal, 2)
+  assert.deepEqual(day.rows.map((row) => row.id).sort(), ['r1', 'r2'])
+}))
+
+check('store：没写过的日期返回 undefined', () => withStore((store) => {
+  assert.equal(store.getDay('o', 'acc', '2026-11-18'), undefined)
+}))
+
+check('store：history 逐日结果可读回（含 available=0）', () => withStore((store) => {
+  store.setHistoryDay('o', 'acc', '2026-11-17', { quota: 12, calls: 3, available: true })
+  store.setHistoryDay('o', 'acc', '2026-11-16', { quota: 0, calls: 0, available: false })
+  const hit = store.getHistoryDay('o', 'acc', '2026-11-17')
+  assert.deepEqual({ ...hit, at: undefined }, { quota: 12, calls: 3, available: true, at: undefined })
+  assert.ok(typeof hit.at === 'number' && hit.at > 0, '应带写入时间，空结果要用它做复检窗口')
+  const empty = store.getHistoryDay('o', 'acc', '2026-11-16')
+  assert.deepEqual({ quota: empty.quota, calls: empty.calls, available: empty.available }, { quota: 0, calls: 0, available: false })
+  assert.equal(store.getHistoryDay('o', 'acc', '2026-11-15'), undefined)
+}))
+
+check('store：prune 删 7 天前账本与 28 天前历史', () => withStore((store) => {
+  store.appendRows('o', 'acc', '2026-11-10', [ROW1], 1, 1)
+  store.appendRows('o', 'acc', '2026-11-19', [ROW1], 1, 1)
+  store.setHistoryDay('o', 'acc', '2026-10-01', { quota: 1, calls: 1, available: true })
+  store.setHistoryDay('o', 'acc', '2026-11-19', { quota: 1, calls: 1, available: true })
+  store.prune('2026-11-19')
+  assert.equal(store.getDay('o', 'acc', '2026-11-10'), undefined)
+  assert.notEqual(store.getDay('o', 'acc', '2026-11-19'), undefined)
+  assert.equal(store.getHistoryDay('o', 'acc', '2026-10-01'), undefined)
+  assert.notEqual(store.getHistoryDay('o', 'acc', '2026-11-19'), undefined)
+}))
+
+check('store：units 缓存在 10 分钟内有效、过期失效', () => withStore((store) => {
+  const at = 1_700_000_000_000
+  store.setUnits('o', { quotaPerUnit: 500_000, usdExchangeRate: 7.3, displayCurrency: 'CNY' }, at)
+  assert.deepEqual(store.getUnits('o', at + 9 * 60_000), { quotaPerUnit: 500_000, usdExchangeRate: 7.3, displayCurrency: 'CNY' })
+  assert.equal(store.getUnits('o', at + 11 * 60_000), undefined)
+}))
+
+check('mapPool：结果保序且在飞数不超上限', async () => {
+  let inFlight = 0
+  let peak = 0
+  const out = await bundle.mapPool([1, 2, 3, 4, 5, 6], 3, async (n) => {
+    inFlight += 1
+    peak = Math.max(peak, inFlight)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    inFlight -= 1
+    return n * 10
+  })
+  assert.deepEqual(out, [10, 20, 30, 40, 50, 60])
+  assert.ok(peak <= 3, '并发峰值应 ≤ 3，实际 ' + peak)
+  assert.ok(peak >= 2, '应当真的并发，实际峰值 ' + peak)
+})
+
+check('retryDelayMs：优先 Retry-After，否则指数退避，且封顶 2.5s', () => {
+  assert.equal(bundle.retryDelayMs(0, undefined), 400)
+  assert.equal(bundle.retryDelayMs(1, undefined), 1200)
+  assert.equal(bundle.retryDelayMs(2, undefined), 2500)
+  assert.equal(bundle.retryDelayMs(0, 2), 2000)
+  // 网关限流时给 99 秒：不能照做，否则一次刷新卡一分半
+  assert.equal(bundle.retryDelayMs(0, 99), 2500)
+})
+
+check('shouldRetryNow：服务端要求等太久就当场放弃', () => {
+  assert.equal(bundle.shouldRetryNow(0, 2), true)
+  assert.equal(bundle.shouldRetryNow(0, 99), false)
+  assert.equal(bundle.shouldRetryNow(0, undefined), true)
+  assert.equal(bundle.shouldRetryNow(2, undefined, 2), false)
+})
+
+check('modelsFromHours：只取当天小时行，同名模型相加并倒序', () => {
+  const rows = [
+    { created_at: Math.floor(new Date('2026-11-19T03:00:00+08:00').getTime() / 1000), quota: 5, count: 2, request_count: 2, model_name: 'gpt', token_used: 100 },
+    { created_at: Math.floor(new Date('2026-11-19T04:00:00+08:00').getTime() / 1000), quota: 7, count: 3, request_count: 3, model_name: 'gpt', token_used: 200 },
+    { created_at: Math.floor(new Date('2026-11-18T04:00:00+08:00').getTime() / 1000), quota: 99, count: 9, request_count: 9, model_name: 'gpt' },
+    { created_at: Math.floor(new Date('2026-11-19T05:00:00+08:00').getTime() / 1000), quota: 40, count: 1, request_count: 1, model_name: 'ds' },
+  ]
+  const out = bundle.modelsFromHours(rows, '2026-11-19')
+  assert.deepEqual(out.map((row) => [row.name, row.quota, row.calls, row.tokens]), [
+    ['ds', 40, 1, 0],
+    ['gpt', 12, 5, 300],
+  ])
+})
+
+check('createLimiter：在飞数不超上限，且任务都能跑完', async () => {
+  const run = bundle.createLimiter(2)
+  let inFlight = 0
+  let peak = 0
+  const out = await Promise.all(Array.from({ length: 10 }, (_, i) => run(async () => {
+    inFlight += 1
+    peak = Math.max(peak, inFlight)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    inFlight -= 1
+    return i
+  })))
+  assert.deepEqual(out, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+  assert.ok(peak <= 2, '在飞峰值应 ≤ 2，实际 ' + peak)
+  assert.ok(peak >= 2, '应当真的并发，实际峰值 ' + peak)
+})
+
+
 /* ---------------- 运行 ---------------- */
 
 let failed = 0
 for (const [name, fn] of checks) {
   try {
-    fn()
+    await fn()
     console.log('  ✓ ' + name)
   } catch (error) {
     failed += 1

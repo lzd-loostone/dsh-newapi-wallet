@@ -23,6 +23,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { fingerprintOrigin } from './fingerprint.ts'
 import { readLedger, aggregate } from './ledger.ts'
+import { sharedStore } from './store.ts'
+import { mapPool, retryDelayMs, shouldRetryNow } from './pool.ts'
+import { gatewayLimit } from './limit.ts'
 import { accountKeyForToken, parseAccounts } from './accounts.ts'
 import type { WalletAccount } from './accounts.ts'
 import { mergeSnapshots } from './merge.ts'
@@ -47,6 +50,13 @@ const LOG_PAGE_SIZE = 100
 const HEAT_DAYS = 28
 /** 缺失日逐日 stat 补探上限（每次 ~80ms）；「今天」豁免预算。超出预算的日期显示「无数据」。 */
 const HEAT_FILL_MAX = 12
+/**
+ * 「这天没有消费」的复检间隔。零消费账号的每个历史日都会探一次，网关对空日期
+ * 返回的是非 success，永远落不了「有数据」——不设这个窗口，它们每次刷新都会被重探。
+ */
+const HISTORY_NEGATIVE_TTL_MS = 30 * 60_000
+/** 账号级并发。实测 5 账号 × 3 请求：串行 0.35s → 3 路 0.14s，5 路无额外收益。 */
+const ACCOUNT_CONCURRENCY = 3
 /** /api/status 读不到汇率时的兜底币种：公司网关即 CNY 展示。 */
 const FALLBACK_CURRENCY = 'CNY'
 
@@ -143,11 +153,14 @@ function epochMs(value: number | undefined): number | undefined {
   return value > 1e12 ? value : value * 1000
 }
 
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
 async function getJson(
   origin: string,
   path: string,
   apiKey: string | undefined,
   params: Record<string, string | number> = {},
+  attempt = 0,
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   const url = new URL(path, origin)
   for (const [key, value] of Object.entries(params)) url.searchParams.set(key, String(value))
@@ -156,8 +169,19 @@ async function getJson(
   try {
     const headers: Record<string, string> = { accept: 'application/json' }
     if (apiKey !== undefined && apiKey !== '') headers.authorization = `Bearer ${apiKey}`
-    const response = await fetch(url, { headers, signal: controller.signal })
+    const response = await gatewayLimit(() => fetch(url, { headers, signal: controller.signal }))
     const body = await response.json().catch(() => ({})) as Record<string, unknown>
+    // 429：实测只有短时间打爆总量才会出现（约 195 请求后，60s 恢复）。
+    // 退避重试两次；401 不重试——那是令牌真的错了。
+    if (response.status === 429) {
+      const retryAfter = Number(response.headers.get('retry-after'))
+      const wait = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined
+      if (shouldRetryNow(attempt, wait)) {
+        await sleep(retryDelayMs(attempt, wait))
+        return getJson(origin, path, apiKey, params, attempt + 1)
+      }
+      // 服务端要等太久（实测 99s）：不在这里干等，交给下一次轮询。
+    }
     return { status: response.status, body }
   } finally {
     clearTimeout(timer)
@@ -170,7 +194,21 @@ function isNewApiOk(status: number, body: Record<string, unknown>): boolean {
   return true
 }
 
+/**
+ * 汇率与换算单位。站点汇率一天也不会变，所以落盘缓存 10 分钟：
+ * 旧实现每个账号每次刷新都打一次匿名 /api/status，5 账号就是 5 个多余请求，
+ * 而且它正是被限流时最先 429 的那一个（429 会让面板误报「不是 New API」）。
+ */
 async function readUnits(origin: string): Promise<QuotaUnits> {
+  const store = sharedStore()
+  const cached = store?.getUnits(origin, Date.now())
+  if (cached !== undefined) {
+    return {
+      quotaPerUnit: cached.quotaPerUnit,
+      usdExchangeRate: cached.usdExchangeRate ?? 1,
+      displayCurrency: cached.displayCurrency === 'USD' ? 'USD' : FALLBACK_CURRENCY,
+    }
+  }
   try {
     const { status, body } = await getJson(origin, '/api/status', undefined)
     const data = (body.data ?? body) as Record<string, unknown>
@@ -181,11 +219,17 @@ async function readUnits(origin: string): Promise<QuotaUnits> {
     const displayCurrency = displayType === 'CNY' || displayType === 'USD'
       ? displayType
       : FALLBACK_CURRENCY
-    return {
+    const units: QuotaUnits = {
       quotaPerUnit: quotaPerUnit > 0 ? quotaPerUnit : 500_000,
       usdExchangeRate: usdExchangeRate > 0 ? usdExchangeRate : 1,
       displayCurrency,
     }
+    store?.setUnits(origin, {
+      quotaPerUnit: units.quotaPerUnit,
+      ...units.usdExchangeRate !== undefined ? { usdExchangeRate: units.usdExchangeRate } : {},
+      ...units.displayCurrency !== undefined ? { displayCurrency: units.displayCurrency } : {},
+    }, Date.now())
+    return units
   } catch {
     return { quotaPerUnit: 500_000, displayCurrency: FALLBACK_CURRENCY }
   }
@@ -388,16 +432,46 @@ interface TodayOutcome {
   models?: TodayGroupRow[]
   rate?: { rpm?: number; tpm?: number }
   reason?: string
+  /** 今日 stat 的原始值，热力图「今天」格直接复用，不再单独打一次。 */
+  todayPoint?: { quota: number; calls: number }
 }
 
+/**
+ * 28 天窗口的小时行。一次 /api/data/self 同时供三处用：热力图的逐日聚合、
+ * 历史日「探过即永久」的落盘来源、以及今日按模型的兜底。
+ * 旧实现为今日模型又单独打了一次「今日窗口」的同名接口。
+ */
+async function readHours28(origin: string, accessKey: string): Promise<unknown[] | undefined> {
+  const now = Date.now()
+  const firstDayStart = localDayStartMs(now - (HEAT_DAYS - 1) * 86_400_000)
+  try {
+    const aggregate = await getJson(origin, '/api/data/self', accessKey, {
+      start_timestamp: Math.floor(firstDayStart / 1000),
+      end_timestamp: Math.floor(now / 1000),
+      default_time: 'hour',
+    })
+    if (!isNewApiOk(aggregate.status, aggregate.body)) return undefined
+    return Array.isArray(aggregate.body.data) ? aggregate.body.data : []
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 今日实扣 + rpm/tpm。**只打 1 个请求**（/api/log/self/stat）：
+ * 按模型的兜底改由 28 天窗口那份 data/self 响应里的今日小时行算出（见 modelsFromHours），
+ * 旧实现为它又单独打了一次今日窗口的 data/self——5 账号就是 5 个纯浪费的请求。
+ */
 async function fetchToday(
   origin: string,
   accessKey: string,
   units: QuotaUnits,
+  hours: unknown[] | undefined,
 ): Promise<TodayOutcome> {
   const now = Date.now()
   const from = Math.floor(localDayStartMs(now) / 1000)
   const to = Math.floor(now / 1000)
+  const today = localDayString(now)
 
   const outcome: TodayOutcome = {}
 
@@ -414,6 +488,7 @@ async function fetchToday(
       if (quota !== undefined) {
         outcome.money = quotaToMoney(quota, units)
         outcome.requests = num(data.count)
+        outcome.todayPoint = { quota, calls: num(data.count) ?? 0 }
       }
       const rpm = num(data.rpm)
       const tpm = num(data.tpm)
@@ -424,137 +499,204 @@ async function fetchToday(
         }
       }
     }
-  } catch { /* 站点可能关闭了用户态统计，继续走 data/self */ }
+  } catch { /* 站点可能关闭了用户态统计，继续用今日小时行兜底 */ }
 
-  // 2) /api/data/self：按模型聚合（今日）。
-  try {
-    const aggregate = await getJson(origin, '/api/data/self', accessKey, {
-      start_timestamp: from,
-      end_timestamp: to,
-      default_time: 'hour',
-    })
-    if (isNewApiOk(aggregate.status, aggregate.body)) {
-      const rows = Array.isArray(aggregate.body.data) ? aggregate.body.data : []
-      const byModel = new Map<string, TodayGroupRow>()
+  // 2) 今日模型兜底：复用 28 天窗口响应里属于今天的小时行。
+  if (hours !== undefined) {
+    const byModel = modelsFromHours(hours, today)
+    if (byModel.length > 0) {
+      outcome.models = byModel
+        .map(row => ({ ...row, amount: quotaToMoney(row.quota, units) }))
+        .sort((a, b) => b.quota - a.quota)
       let quota = 0
       let requests = 0
-      let tokensTotal: number | undefined
-      for (const row of rows) {
-        if (row === null || typeof row !== 'object') continue
-        const record = row as Record<string, unknown>
-        const rowQuota = num(record.quota) ?? 0
-        const rowCalls = num(record.count) ?? 0
-        quota += rowQuota
-        const requestCount = num(record.request_count) ?? 0
-        requests += requestCount > 0 ? requestCount : rowCalls
-        const rowTokens = num(record.token_used)
-        if (rowTokens !== undefined) tokensTotal = (tokensTotal ?? 0) + rowTokens
-        const model = typeof record.model_name === 'string' && record.model_name !== ''
-          ? record.model_name
-          : '未知模型'
-        const existing = byModel.get(model)
-        if (existing === undefined) {
-          byModel.set(model, { name: model, quota: rowQuota, calls: rowCalls, ...(rowTokens !== undefined ? { tokens: rowTokens } : {}) })
-        } else {
-          existing.quota += rowQuota
-          existing.calls += rowCalls
-          if (rowTokens !== undefined) existing.tokens = (existing.tokens ?? 0) + rowTokens
-        }
-      }
-      if (byModel.size > 0) {
-        outcome.models = [...byModel.values()]
-          .map(row => ({ ...row, amount: quotaToMoney(row.quota, units) }))
-          .sort((a, b) => b.quota - a.quota)
+      let tokens: number | undefined
+      for (const row of byModel) {
+        quota += row.quota
+        requests += row.calls
+        if (row.tokens !== undefined) tokens = (tokens ?? 0) + row.tokens
       }
       if (outcome.money === undefined && quota > 0) outcome.money = quotaToMoney(quota, units)
       if (outcome.requests === undefined && requests > 0) outcome.requests = requests
-      if (tokensTotal !== undefined) {
-        outcome.tokens = { ...outcome.tokens, totalTokens: tokensTotal }
-      }
+      if (tokens !== undefined) outcome.tokens = { ...outcome.tokens, totalTokens: tokens }
     }
-  } catch { /* ignore */ }
+  }
 
   if (outcome.money === undefined) outcome.reason = 'gateway-logs-unavailable'
   return outcome
 }
 
 /**
- * 近 4 周逐日消费（热力图口径，一次 /api/data/self 覆盖全部 28 天，窗口 ≤30 天限制内）。
- * 主源：小时行按【本地日期】分组求和——实测与逐日 /api/log/self/stat 完全对账
- * （连续数日 quota 逐位数一致）。「今天」与缺口日改打逐日 stat 补探：
- * 今天强制用 stat 是为了和头部「今日实扣」同源（data/self 实时略有零头差）。
- * 补探预算（HEAT_FILL_MAX）用尽或该日超出网关统计保留范围的，available=false。
+ * 从 /api/data/self 的小时行里取「某一天」的按模型聚合。
+ * 热力图与「今日模型兜底」共用同一次 28 天窗口响应——旧实现为了今日模型又单独打一次今日窗口，
+ * 同一个数据两次请求，是 5 账号 73 个请求里的一整块。
+ */
+export function modelsFromHours(rows: unknown[], today: string): TodayGroupRow[] {
+  const byModel = new Map<string, { quota: number; calls: number; tokens: number }>()
+  for (const row of rows) {
+    if (row === null || typeof row !== 'object') continue
+    const record = row as Record<string, unknown>
+    const ms = epochMs(num(record.created_at))
+    if (ms === undefined || localDayString(ms) !== today) continue
+    const quota = num(record.quota) ?? 0
+    const rowCalls = num(record.count) ?? 0
+    const requestCount = num(record.request_count) ?? 0
+    const tokens = num(record.token_used) ?? 0
+    const model = typeof record.model_name === 'string' && record.model_name !== ''
+      ? record.model_name
+      : '未知模型'
+    const calls = requestCount > 0 ? requestCount : rowCalls
+    const hit = byModel.get(model)
+    if (hit === undefined) byModel.set(model, { quota, calls, tokens })
+    else {
+      hit.quota += quota
+      hit.calls += calls
+      hit.tokens += tokens
+    }
+  }
+  return [...byModel.entries()]
+    .map(([name, value]) => ({ name, quota: value.quota, calls: value.calls, tokens: value.tokens }))
+    .sort((a, b) => b.quota - a.quota)
+}
+
+/**
+ * 近 4 周逐日消费（热力图口径）。**每个历史日只探一次，结果落盘永久**。
+ *
+ * 数据来源优先级（这就是 5 账号 73 请求里 46 个的由来，缓存后归零）：
+ *   1. 本地 history 表命中（历史日的金额永远不会再变）→ 0 请求；
+ *   2. 28 天窗口的小时行按本地日期分组（一次 data/self 覆盖全部 28 天）→ 命中即落盘；
+ *   3. 上面两条都没有的历史日，才逐日打一次 stat 补探（预算 HEAT_FILL_MAX）；
+ *   4. 「今天」永远用今日 stat（与头部实扣同源），且**不落盘**——它还会变。
+ *
+ * 补探按**从新到旧**花预算：旧实现从最老的一天往后花，安装后头几次刷新永远补不到
+ * 最近三天（最该显示的日子），要凑满三四轮才补齐。
+ *
+ * 确认「这天没有消费」也是一条结果（available=false），同样落盘，
+ * 否则零消费的日子每次刷新都会被重探，预算永远被它吃掉。
  */
 async function fetchDailyHistory(
   origin: string,
+  accountKey: string,
   accessKey: string,
   units: QuotaUnits,
+  hours: unknown[] | undefined,
+  todayPoint: { quota: number; calls: number } | undefined,
 ): Promise<DailyPoint[] | undefined> {
   const now = Date.now()
   const todayStr = localDayString(now)
-  const firstDayStart = localDayStartMs(now - (HEAT_DAYS - 1) * 86_400_000)
-  try {
-    const aggregate = await getJson(origin, '/api/data/self', accessKey, {
-      start_timestamp: Math.floor(firstDayStart / 1000),
-      end_timestamp: Math.floor(now / 1000),
-      default_time: 'hour',
-    })
-    if (!isNewApiOk(aggregate.status, aggregate.body)) return undefined
-    const rows = Array.isArray(aggregate.body.data) ? aggregate.body.data : []
-    const byDay = new Map<string, { quota: number; calls: number }>()
-    for (const row of rows) {
-      if (row === null || typeof row !== 'object') continue
-      const record = row as Record<string, unknown>
-      const ms = epochMs(num(record.created_at))
-      if (ms === undefined) continue
-      const key = localDayString(ms)
-      const quota = num(record.quota) ?? 0
-      const calls = num(record.count) ?? 0
-      const hit = byDay.get(key)
-      if (hit === undefined) byDay.set(key, { quota, calls })
-      else { hit.quota += quota; hit.calls += calls }
-    }
-    let fillBudget = HEAT_FILL_MAX
-    const points: DailyPoint[] = []
-    for (let i = HEAT_DAYS - 1; i >= 0; i--) {
-      const dayStart = localDayStartMs(now - i * 86_400_000)
-      const date = localDayString(dayStart)
-      const fromHour = byDay.get(date)
-      let resolved: { quota: number; calls: number } | undefined = fromHour
-      const mustStat = date === todayStr
-      if ((resolved === undefined || mustStat) && (mustStat || fillBudget > 0)) {
-        if (!mustStat) fillBudget -= 1
-        try {
-          const s0 = Math.floor(dayStart / 1000)
-          const s1 = Math.min(s0 + 86_400, Math.floor(now / 1000))
-          const stat = await getJson(origin, '/api/log/self/stat', accessKey, {
-            type: 2,
-            start_timestamp: s0,
-            end_timestamp: s1,
-          })
-          if (isNewApiOk(stat.status, stat.body)) {
-            const data = (stat.body.data ?? {}) as Record<string, unknown>
-            const q = num(data.quota)
-            if (q !== undefined) resolved = { quota: q, calls: num(data.count) ?? 0 }
-          }
-        } catch { /* 单日补探失败：按无数据呈现，不影响整体 */ }
-      }
-      if (resolved !== undefined) {
-        points.push({
-          date,
-          available: true,
-          quota: resolved.quota,
-          calls: resolved.calls,
-          amount: quotaToMoney(resolved.quota, units) ?? { quota: resolved.quota, currency: FALLBACK_CURRENCY },
-        })
-      } else {
-        points.push({ date, available: false, quota: 0 })
-      }
-    }
-    return points
-  } catch {
-    return undefined
+  const store = sharedStore()
+
+  const byDay = new Map<string, { quota: number; calls: number }>()
+  for (const row of hours ?? []) {
+    if (row === null || typeof row !== 'object') continue
+    const record = row as Record<string, unknown>
+    const ms = epochMs(num(record.created_at))
+    if (ms === undefined) continue
+    const key = localDayString(ms)
+    const quota = num(record.quota) ?? 0
+    const calls = num(record.count) ?? 0
+    const hit = byDay.get(key)
+    if (hit === undefined) byDay.set(key, { quota, calls })
+    else { hit.quota += quota; hit.calls += calls }
   }
+
+  /** 升序的 28 天日期。 */
+  const dates: string[] = []
+  const dayStarts = new Map<string, number>()
+  for (let i = HEAT_DAYS - 1; i >= 0; i--) {
+    const dayStart = localDayStartMs(now - i * 86_400_000)
+    const date = localDayString(dayStart)
+    dates.push(date)
+    dayStarts.set(date, dayStart)
+  }
+
+  /** date → 已确定的数字；null = 确认这天没有消费。 */
+  const resolved = new Map<string, { quota: number; calls: number } | null>()
+  const pending: string[] = []
+
+  for (const date of dates) {
+    const isToday = date === todayStr
+    if (isToday) {
+      // 今天：优先用本次已经打过的今日 stat，省掉一次请求。
+      if (todayPoint !== undefined) resolved.set(date, todayPoint)
+      else pending.push(date)
+      continue
+    }
+    const stored = store?.getHistoryDay(origin, accountKey, date)
+    if (stored !== undefined && (stored.available || now - (stored.at ?? 0) < HISTORY_NEGATIVE_TTL_MS)) {
+      resolved.set(date, stored.available ? { quota: stored.quota, calls: stored.calls } : null)
+      continue
+    }
+    const fromHour = byDay.get(date)
+    if (fromHour !== undefined) {
+      // 历史日的小时行是完整的，直接永久落盘；今天的小时行不完整，绝不落盘。
+      store?.setHistoryDay(origin, accountKey, date, { quota: fromHour.quota, calls: fromHour.calls, available: true })
+      resolved.set(date, fromHour)
+      continue
+    }
+    pending.push(date)
+  }
+
+  // 从新到旧补探（倒序遍历）。今天不受预算限制，历史日共用预算。
+  // 首次安装（近 4 周几乎全空）时一次补满：否则按每轮 12 个的预算要三轮才补齐，
+  // 用户看到的热力图头两分钟缺一半——而这批请求一辈子只打一次。
+  const missingDays = pending.filter((date) => date !== todayStr).length
+  const firstFill = missingDays > HEAT_DAYS / 2
+  let fillBudget = firstFill ? HEAT_DAYS : HEAT_FILL_MAX
+  for (const date of [...pending].reverse()) {
+    const isToday = date === todayStr
+    if (!isToday) {
+      if (fillBudget <= 0) continue
+      fillBudget -= 1
+    }
+    const dayStart = dayStarts.get(date) ?? now
+    try {
+      const s0 = Math.floor(dayStart / 1000)
+      const s1 = Math.min(s0 + 86_400, Math.floor(now / 1000))
+      const stat = await getJson(origin, '/api/log/self/stat', accessKey, {
+        type: 2,
+        start_timestamp: s0,
+        end_timestamp: s1,
+      })
+      if (!isNewApiOk(stat.status, stat.body)) {
+        // 非 success 多半就是「这天没有记录」（零消费账号的每个历史日都这样）。
+        // 记一条带时间戳的空结果，压到 30 分钟内不再重探；到期自动重试，不会永久钉死。
+        if (!isToday) store?.setHistoryDay(origin, accountKey, date, { quota: 0, calls: 0, available: false })
+        continue
+      }
+      const data = (stat.body.data ?? {}) as Record<string, unknown>
+      const q = num(data.quota)
+      const point = q !== undefined ? { quota: q, calls: num(data.count) ?? 0 } : null
+      resolved.set(date, point)
+      if (!isToday) {
+        store?.setHistoryDay(origin, accountKey, date, {
+          quota: point?.quota ?? 0,
+          calls: point?.calls ?? 0,
+          available: point !== null,
+        })
+      }
+    } catch { /* 单日补探失败：留空，下次再试；不落盘（失败不是「没有消费」） */ }
+  }
+
+  let resolvedAny = false
+  const points: DailyPoint[] = dates.map((date) => {
+    const point = resolved.get(date)
+    if (point !== undefined && point !== null) {
+      resolvedAny = true
+      return {
+        date,
+        available: true,
+        quota: point.quota,
+        calls: point.calls,
+        amount: quotaToMoney(point.quota, units) ?? { quota: point.quota, currency: FALLBACK_CURRENCY },
+      }
+    }
+    return { date, available: false, quota: 0 }
+  })
+
+  // 一条都拿不到（没有小时行、没有缓存、补探全失败）：当作热力图不可用。
+  if (!resolvedAny && hours === undefined) return undefined
+  return points
 }
 
 
@@ -584,12 +726,15 @@ async function readNewApi(
     keyName = displayName
   }
 
-  const today = await fetchToday(account.origin, accessKey, units)
+  // 28 天窗口的小时行：只打一次，供今日模型兜底 + 热力图 + 历史日落盘。
+  const hours = await readHours28(account.origin, accessKey)
+  const today = await fetchToday(account.origin, accessKey, units, hours)
   const todayOk = today.reason === undefined && today.money !== undefined
 
   // 全天账单：本地缓存 + 增量追加 + 本地筛选（详见 ledger.ts）。
   // 筛选只作用于右侧「今日用量」与「最近调用」；头部实扣与热力图恒为全天口径（用户拍板）。
-  const ledger = await readLedger(account.origin, accountKeyForToken(accessKey), accessKey, filter)
+  const accountKey = accountKeyForToken(accessKey)
+  const ledger = await readLedger(account.origin, accountKey, accessKey, filter)
   // 逐条明细要带金额：客户端对 undefined 一律渲染「—」，整个金额列就空白了。
   // 账本缓存只存 quota 点数（单位换算依赖站点 /api/status，属于本层），所以在这里换成 Money。
   const recentCalls: CallRecord[] | undefined = ledger !== undefined && ledger.calls.length > 0
@@ -609,7 +754,7 @@ async function readNewApi(
     : undefined
 
   // 近 4 周逐日消费（热力图）。实测 /api/data/self 忽略筛选参数，所以它永远是全天口径。
-  const dailyHistory = await fetchDailyHistory(account.origin, accessKey, units)
+  const dailyHistory = await fetchDailyHistory(account.origin, accountKey, accessKey, units, hours, today.todayPoint)
 
   // 今日 token 桶：四桶与合计一律来自全天账本行，彼此同源 —— 四桶之和恒等于合计，
   // 不再取 /api/data/self 的小时汇总（那个口径当前小时滞后，会让合计与三行对不上，是旧缺陷）。
@@ -730,20 +875,19 @@ export async function fetchWallet(
     return { ok: false, error: 'no-access-token', detail: account.route }
   }
 
-  // 逐账号顺序取数，不并行：每个账号冷启动最多 200 页 × 12 并发，
-  // 三个账号同时开就是 36 并发，容易把自建网关打出 429。冷启动只在每天首次刷新发生。
-  const parts: AccountPart[] = []
-  for (const tokenAccount of tokens) {
+  // 账号级 3 路并发（mapPool 保序）。账号内部仍然串行，账本翻页自带 12 并发；
+  // 3 是实测拐点：再多并发只是把网关的抖动叠在一起，还会更快撞到限流。
+  const parts = await mapPool(tokens, ACCOUNT_CONCURRENCY, async (tokenAccount): Promise<AccountPart> => {
     const scoped = filter.token !== undefined
       ? { ...filter, token: tokenNameForAccount(filter.token, tokenAccount.name) }
       : filter
     try {
-      parts.push({ name: tokenAccount.name, snapshot: await readNewApi(account, tokenAccount.token, scoped) })
+      return { name: tokenAccount.name, snapshot: await readNewApi(account, tokenAccount.token, scoped) }
     } catch (error) {
       const name = error instanceof Error && error.name === 'AbortError' ? 'timeout' : 'unreachable'
-      parts.push({ name: tokenAccount.name, snapshot: { ok: false, error: name, detail: account.origin } })
+      return { name: tokenAccount.name, snapshot: { ok: false, error: name, detail: account.origin } }
     }
-  }
+  })
 
   const merged = mergeSnapshots(parts, resolveLowBalanceCny())
   if (merged.ok !== true) return merged
